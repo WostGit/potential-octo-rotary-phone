@@ -273,6 +273,8 @@ jobs:
           log("OPENAI_BASE_URL   :", os.environ.get("OPENAI_BASE_URL"))
           log("MODEL             :", os.environ.get("MODEL"))
           log("MAX_TURNS         :", os.environ.get("MAX_TURNS"))
+          log("REASONING_EFFORT  : high (extra_body)")
+          log("THINKING          : enabled (forced on GLM-5.3-Flash)")
           log("cwd               :", os.getcwd())
           log("BINARY            :", os.environ.get("BINARY_PATH") or "/tmp/vuln_bin")
           log("=" * 80)
@@ -350,8 +352,13 @@ jobs:
                           messages=messages,
                           tools=tools,
                           tool_choice="auto",
-                          max_tokens=4096,
+                          max_tokens=8192,
                           temperature=0.15,
+                          # GLM-5.3-Flash: forced thinking; control depth via reasoning_effort
+                          extra_body={
+                              "thinking": {"type": "enabled"},
+                              "reasoning_effort": "high",
+                          },
                       )
                       elapsed = time.time() - t0
                       log(f"<<< API returned in {elapsed:.2f}s")
@@ -396,10 +403,23 @@ jobs:
               log(f"finish_reason = {finish}")
 
               # append assistant message (must be valid for next round)
+              # Preserve reasoning / reasoning_content for GLM interleaved thinking
               assistant_msg = {
                   "role": "assistant",
                   "content": msg.content,
               }
+              # GonkaRouter/vLLM exposes reasoning on message.reasoning;
+              # some providers use reasoning_content — keep both if present.
+              reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
+              if reasoning:
+                  # Prefer the field name the upstream returned so re-injection matches.
+                  if getattr(msg, "reasoning", None) is not None:
+                      assistant_msg["reasoning"] = msg.reasoning
+                  if getattr(msg, "reasoning_content", None) is not None:
+                      assistant_msg["reasoning_content"] = msg.reasoning_content
+                  # Also stash under a neutral key some OpenAI-compat proxies accept
+                  if "reasoning" not in assistant_msg and "reasoning_content" not in assistant_msg:
+                      assistant_msg["reasoning"] = reasoning
               if msg.tool_calls:
                   assistant_msg["tool_calls"] = [
                       {
@@ -411,6 +431,9 @@ jobs:
                   ]
               messages.append(assistant_msg)
 
+              if reasoning:
+                  log("----- assistant reasoning -----")
+                  log(reasoning if isinstance(reasoning, str) else str(reasoning)[:8000])
               if msg.content:
                   log("----- assistant text -----")
                   log(msg.content)
