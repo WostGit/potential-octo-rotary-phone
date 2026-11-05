@@ -130,6 +130,14 @@ jobs:
           MAX_TURNS: ${{ github.event.inputs.max_turns || '80' }}
           AGENT_TIMEOUT_MIN: ${{ github.event.inputs.agent_timeout_minutes || '90' }}
           HEARTBEAT_SEC: ${{ github.event.inputs.heartbeat_seconds || '60' }}
+          # First-byte watchdog: kill agent if log still empty after this many seconds
+          FIRST_BYTE_TIMEOUT_SEC: "120"
+          # Claude Code may send thinking:{type:adaptive} which some routers stall on.
+          # GLM-5.3-Flash still reasons server-side; this only stops CC's adaptive wrapper.
+          CLAUDE_CODE_DISABLE_THINKING: "1"
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          # Prefer large completion budget so reasoning tokens don't eat the reply
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8192"
         run: |
           set -euo pipefail
 
@@ -143,75 +151,84 @@ jobs:
             BINARY="${BINARY_PATH}"
           fi
 
-          # Validate numeric inputs
           if ! [[ "$AGENT_TIMEOUT_MIN" =~ ^[0-9]+$ ]] || [ "$AGENT_TIMEOUT_MIN" -lt 1 ]; then
-            echo "Invalid agent_timeout_minutes='$AGENT_TIMEOUT_MIN' — using 90"
             AGENT_TIMEOUT_MIN=90
           fi
           if ! [[ "$HEARTBEAT_SEC" =~ ^[0-9]+$ ]] || [ "$HEARTBEAT_SEC" -lt 10 ]; then
-            echo "Invalid heartbeat_seconds='$HEARTBEAT_SEC' — using 60"
             HEARTBEAT_SEC=60
+          fi
+          if ! [[ "${FIRST_BYTE_TIMEOUT_SEC:-}" =~ ^[0-9]+$ ]]; then
+            FIRST_BYTE_TIMEOUT_SEC=120
           fi
           AGENT_TIMEOUT_SEC=$(( AGENT_TIMEOUT_MIN * 60 ))
 
           echo "############################################################"
           echo "# AGENT START"
-          echo "# model              : $MODEL"
-          echo "# base_url           : $ANTHROPIC_BASE_URL"
-          echo "# binary             : $BINARY"
-          echo "# max_turns          : $MAX_TURNS"
-          echo "# agent_timeout_min  : $AGENT_TIMEOUT_MIN  (${AGENT_TIMEOUT_SEC}s hard limit)"
-          echo "# heartbeat_every    : ${HEARTBEAT_SEC}s"
-          echo "# effort             : max (GLM-5.3-Flash forced thinking)"
-          echo "# time_utc           : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "# model                 : $MODEL"
+          echo "# base_url              : $ANTHROPIC_BASE_URL"
+          echo "# binary                : $BINARY"
+          echo "# max_turns             : $MAX_TURNS"
+          echo "# agent_timeout_min     : $AGENT_TIMEOUT_MIN (${AGENT_TIMEOUT_SEC}s)"
+          echo "# first_byte_timeout_s  : $FIRST_BYTE_TIMEOUT_SEC"
+          echo "# heartbeat_every       : ${HEARTBEAT_SEC}s"
+          echo "# effort                : max"
+          echo "# disable_thinking_env  : $CLAUDE_CODE_DISABLE_THINKING (stops CC adaptive param only)"
+          echo "# time_utc              : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "############################################################"
 
           # ----------------------------------------------------------------
-          # Preflight: fail fast if router/auth is broken
+          # Preflight router (fail fast)
           # ----------------------------------------------------------------
           echo ""
           echo "===== PREFLIGHT: GonkaRouter /v1/messages ====="
-          PREFLIGHT_BODY=$(cat <<'JSON'
-          {
-            "model": "zai-org/GLM-5.3-Flash",
-            "max_tokens": 256,
-            "messages": [{"role": "user", "content": "Reply with exactly: pong"}]
-          }
-          JSON
-          )
-          # Strip leading indentation from heredoc for valid JSON
-          PREFLIGHT_BODY=$(echo "$PREFLIGHT_BODY" | sed 's/^[[:space:]]*//')
-
+          PREFLIGHT_JSON='{"model":"zai-org/GLM-5.3-Flash","max_tokens":256,"messages":[{"role":"user","content":"Reply with exactly: pong"}]}'
           set +e
-          PREFLIGHT_RESP=$(curl -sS -w "\n%{http_code}" --max-time 60 \
+          PREFLIGHT_RESP=$(curl -sS -w "\n%{http_code}" --max-time 90 \
             -X POST "${ANTHROPIC_BASE_URL}/v1/messages" \
             -H "x-api-key: ${ANTHROPIC_API_KEY}" \
             -H "Authorization: Bearer ${ANTHROPIC_API_KEY}" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
-            -d "$PREFLIGHT_BODY" 2>&1)
+            -d "$PREFLIGHT_JSON" 2>&1)
           PREFLIGHT_RC=$?
           set -e
-
           PREFLIGHT_CODE=$(echo "$PREFLIGHT_RESP" | tail -n1)
           PREFLIGHT_BODY_OUT=$(echo "$PREFLIGHT_RESP" | sed '$d')
-
           echo "preflight_curl_rc=$PREFLIGHT_RC  http_status=$PREFLIGHT_CODE"
           echo "----- preflight response (truncated) -----"
-          echo "$PREFLIGHT_BODY_OUT" | head -c 2000
+          echo "$PREFLIGHT_BODY_OUT" | head -c 2500
           echo ""
           echo "----- end preflight -----"
-
           if [ "$PREFLIGHT_RC" -ne 0 ] || [ "$PREFLIGHT_CODE" != "200" ]; then
             echo "ERROR: GonkaRouter preflight failed (rc=$PREFLIGHT_RC status=$PREFLIGHT_CODE)"
-            echo "Fix API key / base URL before running the agent."
             exit 1
           fi
-          if ! echo "$PREFLIGHT_BODY_OUT" | grep -qiE 'pong|content|text|message'; then
-            echo "WARNING: preflight 200 but response did not look like a normal message"
-          else
-            echo "Preflight OK — router responds to zai-org/GLM-5.3-Flash"
+          echo "Preflight OK"
+          echo ""
+
+          # Quick CLI self-check (short prompt, must produce bytes)
+          echo "===== CLI SMOKE: claude -p 'say hi' (30s) ====="
+          set +e
+          SMOKE_OUT=$(timeout --foreground 30s stdbuf -oL -eL \
+            claude --print --bare --dangerously-skip-permissions \
+              --permission-mode bypassPermissions \
+              --model "$MODEL" --effort max \
+              "Reply with exactly the single word: hi" 2>&1)
+          SMOKE_RC=$?
+          set -e
+          echo "smoke_rc=$SMOKE_RC"
+          echo "smoke_bytes=$(printf '%s' "$SMOKE_OUT" | wc -c)"
+          echo "----- smoke output -----"
+          printf '%s\n' "$SMOKE_OUT" | head -c 1500
+          echo ""
+          echo "----- end smoke -----"
+          if [ "$SMOKE_RC" -ne 0 ] || [ "$(printf '%s' "$SMOKE_OUT" | wc -c)" -lt 1 ]; then
+            echo "ERROR: Claude Code smoke test produced no output or failed."
+            echo "Router may accept curl but Claude Code hangs on this model/path."
+            echo "Check CLAUDE_CODE / GonkaRouter compatibility, model id, and API key type."
+            exit 1
           fi
+          echo "Smoke OK"
           echo ""
 
           PROMPT=$(cat <<EOF
@@ -243,10 +260,14 @@ jobs:
           echo "===== END PROMPT ====="
           echo ""
 
+          : > /tmp/agent_full.log
+          : > /tmp/agent_pid.txt
+
           # ----------------------------------------------------------------
-          # Heartbeat: print every HEARTBEAT_SEC so the step never looks frozen
+          # Heartbeat + first-byte watchdog
           # ----------------------------------------------------------------
           HEARTBEAT_PID=""
+          AGENT_PGID=""
           cleanup() {
             if [ -n "${HEARTBEAT_PID:-}" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
               kill "$HEARTBEAT_PID" 2>/dev/null || true
@@ -254,8 +275,6 @@ jobs:
             fi
           }
           trap cleanup EXIT
-
-          : > /tmp/agent_full.log
 
           (
             i=0
@@ -267,33 +286,74 @@ jobs:
               log_lines=$(wc -l < /tmp/agent_full.log 2>/dev/null || echo 0)
               remain=$(( AGENT_TIMEOUT_SEC - elapsed ))
               [ "$remain" -lt 0 ] && remain=0
+
+              # Process diagnostics
+              apid=$(cat /tmp/agent_pid.txt 2>/dev/null || true)
+              pst=""
+              if [ -n "$apid" ] && kill -0 "$apid" 2>/dev/null; then
+                pst=$(ps -o pid,stat,etime,pcpu,pmem,cmd -p "$apid" --no-headers 2>/dev/null || true)
+              else
+                pst="(agent pid not running)"
+              fi
+
               echo "[heartbeat $(date -u +%H:%M:%SZ)] elapsed=${elapsed}s  agent_log=${log_bytes}B/${log_lines}lines  (timeout in ${remain}s)"
+              echo "[heartbeat] process: $pst"
+
+              # First-byte watchdog: no log growth after FIRST_BYTE_TIMEOUT_SEC → kill agent
+              if [ "$log_bytes" -eq 0 ] && [ "$elapsed" -ge "$FIRST_BYTE_TIMEOUT_SEC" ]; then
+                echo "[watchdog] NO OUTPUT after ${FIRST_BYTE_TIMEOUT_SEC}s — killing agent process group"
+                if [ -n "$apid" ]; then
+                  # Kill process group if possible
+                  kill -TERM -"$apid" 2>/dev/null || kill -TERM "$apid" 2>/dev/null || true
+                  sleep 5
+                  kill -KILL -"$apid" 2>/dev/null || kill -KILL "$apid" 2>/dev/null || true
+                fi
+                # Also poke any leftover claude
+                pkill -TERM -f "claude --print" 2>/dev/null || true
+                sleep 2
+                pkill -KILL -f "claude --print" 2>/dev/null || true
+                exit 0
+              fi
             done
           ) &
           HEARTBEAT_PID=$!
-          echo "Heartbeat started (pid=$HEARTBEAT_PID, every ${HEARTBEAT_SEC}s)"
+          echo "Heartbeat+watchdog started (pid=$HEARTBEAT_PID, every ${HEARTBEAT_SEC}s, first_byte=${FIRST_BYTE_TIMEOUT_SEC}s)"
 
           # ----------------------------------------------------------------
-          # Run Claude Code under hard timeout + line buffering
-          # stdbuf forces line-buffered stdout/stderr so | tee shows output live
-          # (Claude Code often block-buffers when not attached to a TTY)
-          # Keep --effort max: GLM-5.3-Flash uses forced thinking; max is correct.
-          # Do NOT set CLAUDE_CODE_DISABLE_THINKING — model cannot disable thinking.
+          # Run under a pseudo-TTY (script) so Claude Code streams like interactive.
+          # Pipe buffering alone is not enough — Node often stays silent without a TTY.
           # ----------------------------------------------------------------
-          set +e
-          timeout --foreground --signal=TERM --kill-after=30s "${AGENT_TIMEOUT_SEC}s" \
-            stdbuf -oL -eL \
-              claude --print \
-                --bare \
-                --dangerously-skip-permissions \
-                --permission-mode bypassPermissions \
-                --model "$MODEL" \
-                --effort max \
-                --max-turns "$MAX_TURNS" \
-                --verbose \
-                "$PROMPT" \
+          printf '%s' "$PROMPT" > /tmp/agent_prompt.txt
+
+          # Helper script keeps quoting simple and is easy to kill by pgid
+          cat > /tmp/run_claude_agent.sh << 'RUNEOF'
+          #!/bin/bash
+          set -o pipefail
+          claude --print \
+            --bare \
+            --dangerously-skip-permissions \
+            --permission-mode bypassPermissions \
+            --model "$MODEL" \
+            --effort max \
+            --max-turns "$MAX_TURNS" \
+            --verbose \
+            --output-format text \
+            "$(cat /tmp/agent_prompt.txt)" \
             2>&1 | stdbuf -oL -eL tee -a /tmp/agent_full.log
-          PIPE_RC=${PIPESTATUS[0]}
+          RUNEOF
+          # Unindent heredoc body (YAML indent leaked into file)
+          sed -i 's/^          //' /tmp/run_claude_agent.sh
+          chmod +x /tmp/run_claude_agent.sh
+
+          set +e
+          setsid timeout --signal=TERM --kill-after=30s "${AGENT_TIMEOUT_SEC}s" \
+            script -q -e -c "/tmp/run_claude_agent.sh" /dev/null &
+          AGENT_WRAPPER_PID=$!
+          echo "$AGENT_WRAPPER_PID" > /tmp/agent_pid.txt
+          echo "Agent wrapper pid=$AGENT_WRAPPER_PID"
+
+          wait "$AGENT_WRAPPER_PID"
+          PIPE_RC=$?
           set -e
 
           cleanup
@@ -301,14 +361,27 @@ jobs:
 
           AGENT_RC=$PIPE_RC
           TIMED_OUT=false
+          NO_OUTPUT=false
+          log_bytes=$(wc -c < /tmp/agent_full.log 2>/dev/null || echo 0)
+
           if [ "$PIPE_RC" -eq 124 ]; then
             TIMED_OUT=true
             echo ""
             echo "############################################################"
             echo "# AGENT TIMED OUT after ${AGENT_TIMEOUT_MIN} minutes"
-            echo "# (timeout sent SIGTERM, then SIGKILL after 30s if needed)"
             echo "############################################################"
             AGENT_RC=124
+          fi
+          if [ "$log_bytes" -eq 0 ]; then
+            NO_OUTPUT=true
+            echo ""
+            echo "############################################################"
+            echo "# AGENT PRODUCED ZERO OUTPUT"
+            echo "# (watchdog may have killed it after ${FIRST_BYTE_TIMEOUT_SEC}s)"
+            echo "############################################################"
+            if [ "$AGENT_RC" -eq 0 ]; then
+              AGENT_RC=1
+            fi
           fi
 
           echo ""
@@ -316,8 +389,9 @@ jobs:
           echo "# AGENT FINISHED"
           echo "# exit_code : $AGENT_RC"
           echo "# timed_out : $TIMED_OUT"
+          echo "# no_output : $NO_OUTPUT"
           echo "# time_utc  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          echo "# log_bytes : $(wc -c < /tmp/agent_full.log 2>/dev/null || echo 0)"
+          echo "# log_bytes : $log_bytes"
           echo "# log_lines : $(wc -l < /tmp/agent_full.log 2>/dev/null || echo 0)"
           echo "############################################################"
 
@@ -332,6 +406,7 @@ jobs:
 
           echo "$AGENT_RC" > /tmp/agent_rc.txt
           echo "$TIMED_OUT" > /tmp/agent_timed_out.txt
+          echo "$NO_OUTPUT" > /tmp/agent_no_output.txt
 
       - name: Ultra-verbose PoC verification & diagnostics
         id: verify
@@ -500,6 +575,7 @@ jobs:
             /tmp/run_stdin.err
             /tmp/agent_rc.txt
             /tmp/agent_timed_out.txt
+            /tmp/agent_no_output.txt
           if-no-files-found: warn
           retention-days: 30
 
