@@ -13,6 +13,16 @@ on:
         required: false
         default: "120"
         type: string
+      agent_timeout_minutes:
+        description: "Hard timeout for the Claude agent step only (minutes)"
+        required: false
+        default: "90"
+        type: string
+      heartbeat_seconds:
+        description: "Print a heartbeat every N seconds while agent runs"
+        required: false
+        default: "60"
+        type: string
 
 jobs:
   solve-arvo-44034:
@@ -118,6 +128,8 @@ jobs:
           ANTHROPIC_BASE_URL: ${{ env.GONKA_BASE_URL }}
           BINARY_PATH: ${{ steps.layout.outputs.BINARY_PATH }}
           MAX_TURNS: ${{ github.event.inputs.max_turns || '80' }}
+          AGENT_TIMEOUT_MIN: ${{ github.event.inputs.agent_timeout_minutes || '90' }}
+          HEARTBEAT_SEC: ${{ github.event.inputs.heartbeat_seconds || '60' }}
         run: |
           set -euo pipefail
 
@@ -131,13 +143,26 @@ jobs:
             BINARY="${BINARY_PATH}"
           fi
 
+          # Validate numeric inputs
+          if ! [[ "$AGENT_TIMEOUT_MIN" =~ ^[0-9]+$ ]] || [ "$AGENT_TIMEOUT_MIN" -lt 1 ]; then
+            echo "Invalid agent_timeout_minutes='$AGENT_TIMEOUT_MIN' — using 90"
+            AGENT_TIMEOUT_MIN=90
+          fi
+          if ! [[ "$HEARTBEAT_SEC" =~ ^[0-9]+$ ]] || [ "$HEARTBEAT_SEC" -lt 10 ]; then
+            echo "Invalid heartbeat_seconds='$HEARTBEAT_SEC' — using 60"
+            HEARTBEAT_SEC=60
+          fi
+          AGENT_TIMEOUT_SEC=$(( AGENT_TIMEOUT_MIN * 60 ))
+
           echo "############################################################"
           echo "# AGENT START"
-          echo "# model     : $MODEL"
-          echo "# base_url  : $ANTHROPIC_BASE_URL"
-          echo "# binary    : $BINARY"
-          echo "# max_turns : $MAX_TURNS"
-          echo "# time_utc  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "# model              : $MODEL"
+          echo "# base_url           : $ANTHROPIC_BASE_URL"
+          echo "# binary             : $BINARY"
+          echo "# max_turns          : $MAX_TURNS"
+          echo "# agent_timeout_min  : $AGENT_TIMEOUT_MIN  (${AGENT_TIMEOUT_SEC}s hard limit)"
+          echo "# heartbeat_every    : ${HEARTBEAT_SEC}s"
+          echo "# time_utc           : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "############################################################"
 
           PROMPT=$(cat <<EOF
@@ -169,22 +194,67 @@ jobs:
           echo "===== END PROMPT ====="
           echo ""
 
-          # Full unfiltered transcript
+          # Heartbeat: print a line every HEARTBEAT_SEC so the step never looks frozen
+          HEARTBEAT_PID=""
+          cleanup() {
+            if [ -n "${HEARTBEAT_PID:-}" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
+              kill "$HEARTBEAT_PID" 2>/dev/null || true
+              wait "$HEARTBEAT_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          (
+            i=0
+            while true; do
+              sleep "$HEARTBEAT_SEC"
+              i=$((i + 1))
+              elapsed=$((i * HEARTBEAT_SEC))
+              log_bytes=$(wc -c < /tmp/agent_full.log 2>/dev/null || echo 0)
+              log_lines=$(wc -l < /tmp/agent_full.log 2>/dev/null || echo 0)
+              echo "[heartbeat $(date -u +%H:%M:%SZ)] elapsed=${elapsed}s  agent_log=${log_bytes}B/${log_lines}lines  (timeout in $((AGENT_TIMEOUT_SEC - elapsed))s)"
+            done
+          ) &
+          HEARTBEAT_PID=$!
+          echo "Heartbeat started (pid=$HEARTBEAT_PID, every ${HEARTBEAT_SEC}s)"
+
+          # Full unfiltered transcript under hard timeout
+          # timeout returns 124 on expiry; we preserve the real agent rc when possible
           set +e
-          claude --print \
-            --bare \
-            --dangerously-skip-permissions \
-            --model "$MODEL" \
-            --effort max \
-            --max-turns "$MAX_TURNS" \
-            "$PROMPT" 2>&1 | tee /tmp/agent_full.log
-          AGENT_RC=${PIPESTATUS[0]}
+          : > /tmp/agent_full.log
+          timeout --foreground --signal=TERM --kill-after=30s "${AGENT_TIMEOUT_SEC}s" \
+            claude --print \
+              --bare \
+              --dangerously-skip-permissions \
+              --model "$MODEL" \
+              --effort max \
+              --max-turns "$MAX_TURNS" \
+              "$PROMPT" 2>&1 | tee -a /tmp/agent_full.log
+          PIPE_RC=${PIPESTATUS[0]}
+          TEE_RC=${PIPESTATUS[1]}
           set -e
+
+          cleanup
+          trap - EXIT
+
+          AGENT_RC=$PIPE_RC
+          TIMED_OUT=false
+          if [ "$PIPE_RC" -eq 124 ]; then
+            TIMED_OUT=true
+            echo ""
+            echo "############################################################"
+            echo "# AGENT TIMED OUT after ${AGENT_TIMEOUT_MIN} minutes"
+            echo "# (timeout sent SIGTERM, then SIGKILL after 30s if needed)"
+            echo "############################################################"
+            # Prefer a non-zero rc so later steps know it did not finish cleanly
+            AGENT_RC=124
+          fi
 
           echo ""
           echo "############################################################"
           echo "# AGENT FINISHED"
           echo "# exit_code : $AGENT_RC"
+          echo "# timed_out : $TIMED_OUT"
           echo "# time_utc  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "# log_bytes : $(wc -c < /tmp/agent_full.log 2>/dev/null || echo 0)"
           echo "# log_lines : $(wc -l < /tmp/agent_full.log 2>/dev/null || echo 0)"
@@ -200,6 +270,7 @@ jobs:
           tail -n 100 /tmp/agent_full.log || true
 
           echo "$AGENT_RC" > /tmp/agent_rc.txt
+          echo "$TIMED_OUT" > /tmp/agent_timed_out.txt
 
       - name: Ultra-verbose PoC verification & diagnostics
         id: verify
@@ -321,6 +392,9 @@ jobs:
           POC_SIZE=$(wc -c < "$POC" 2>/dev/null || echo 0)
           POC_HEX_PREFIX=$(xxd -p < "$POC" 2>/dev/null | tr -d '\n' | head -c 4096 || true)
 
+          AGENT_RC_VAL=$(cat /tmp/agent_rc.txt 2>/dev/null || echo unknown)
+          AGENT_TIMED_OUT=$(cat /tmp/agent_timed_out.txt 2>/dev/null || echo false)
+
           cat > result.json <<EOF
           {
             "task": "cybergym/arvo:44034-vul.exp.none-nogit",
@@ -331,6 +405,8 @@ jobs:
             "poc_exists": $([ -f "$POC" ] && echo true || echo false),
             "poc_size_bytes": $POC_SIZE,
             "poc_hex_prefix": "$POC_HEX_PREFIX",
+            "agent_exit_code": "$AGENT_RC_VAL",
+            "agent_timed_out": $AGENT_TIMED_OUT,
             "agent_log_bytes": $(wc -c < /tmp/agent_full.log 2>/dev/null || echo 0),
             "timestamp_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           }
@@ -362,6 +438,7 @@ jobs:
             /tmp/run_stdin.out
             /tmp/run_stdin.err
             /tmp/agent_rc.txt
+            /tmp/agent_timed_out.txt
           if-no-files-found: warn
           retention-days: 30
 
