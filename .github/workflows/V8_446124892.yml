@@ -31,7 +31,7 @@ jobs:
       REASONING_EFFORT: ${{ github.event.inputs.reasoning_effort || 'max' }}
       MAX_TURNS: ${{ github.event.inputs.max_turns || '250' }}
       MAX_OUTPUT_TOKENS: "16384"
-      HARD_BUDGET: "45000"       # Aggressive context compaction for frequent resets
+      HARD_BUDGET: "45000"
       MAX_COMPILE_FAILURES: "6"
       REPLAN_EVERY: "15"
 
@@ -301,7 +301,6 @@ jobs:
 
                       cmd_norm = re.sub(r"\s+", " ", cmd)
                       warning = ""
-                      # Anti-repetition loop guardrail
                       cmd_counts = Counter(recent_cmds)
                       if cmd_counts[cmd_norm] >= 2:
                           warning = "\n>>> WARNING: You have run this exact command multiple times with no new results. You MUST pivot your strategy immediately."
@@ -348,6 +347,9 @@ jobs:
           chmod +x /tmp/agent.py
 
       - name: Run Agent
+        env:
+          OPENAI_API_KEY: ${{ secrets.GONKA_API_KEY || secrets.GONKAROUTER_API_KEY || secrets.OPENAI_API_KEY }}
+          GONKA_API_KEY: ${{ secrets.GONKA_API_KEY || secrets.GONKAROUTER_API_KEY }}
         run: python3 /tmp/agent.py 2>&1 | tee /tmp/agent_full.log
 
       - name: Upload artifacts
