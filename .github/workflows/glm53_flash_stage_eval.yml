@@ -436,96 +436,150 @@ jobs:
               return p.returncode, out[-20000:]
 
           transcript = []
+          print("=" * 72, flush=True)
+          print("AGENT BOOT", flush=True)
+          print(f"  MODEL={MODEL}", flush=True)
+          print(f"  BASE_URL={BASE_URL}", flush=True)
+          print(f"  REASONING_EFFORT={REASONING_EFFORT}", flush=True)
+          print(f"  MAX_TURNS={MAX}", flush=True)
+          print(f"  WORK={WORK}", flush=True)
+          print(f"  OUT={OUT}", flush=True)
+          print("=" * 72, flush=True)
+
           for t in range(MAX):
-              if t == 0:
-                  print(f"MODEL={MODEL} BASE_URL={BASE_URL} REASONING_EFFORT={REASONING_EFFORT} MAX_TURNS={MAX}", flush=True)
-              print(f"=== TURN {t} ===", flush=True)
+              print("", flush=True)
+              print("=" * 72, flush=True)
+              print(f"=== TURN {t}/{MAX - 1}  messages_in_context={len(messages)} ===", flush=True)
+              print("=" * 72, flush=True)
+              t0 = time.time()
               try:
+                  print(f"[turn {t}] calling chat API...", flush=True)
                   raw = chat(messages)
+                  dt = time.time() - t0
+                  print(f"[turn {t}] chat OK in {dt:.1f}s  reply_chars={len(raw or '')}", flush=True)
               except Exception as e:
                   err = f"API_ERROR: {e}"
-                  print(err, flush=True)
+                  print(f"[turn {t}] {err}", flush=True)
                   (turns_dir / f"turn_{t:03d}.txt").write_text(err)
                   transcript.append({"turn": t, "error": err})
-                  # one extra long cooldown then continue to next turn if early;
-                  # only abort if we keep failing
                   fail_count = sum(1 for x in transcript if x.get("error"))
+                  print(f"[turn {t}] api_fail_count={fail_count}", flush=True)
                   if fail_count >= 3:
-                      print("Too many consecutive API failures; aborting agent loop.", flush=True)
+                      print("Too many API failures; aborting agent loop.", flush=True)
                       break
-                  print("Cooling down 90s before next turn...", flush=True)
+                  print("[turn {t}] Cooling down 90s before next turn...".format(t=t), flush=True)
                   time.sleep(90)
                   continue
 
-              (turns_dir / f"turn_{t:03d}_model.txt").write_text(raw)
-              # parse JSON object
-              m = re.search(r"\{[\s\S]*\}", raw)
+              (turns_dir / f"turn_{t:03d}_model.txt").write_text(raw or "")
+              # verbose model preview
+              preview = (raw or "").replace("\r", "")
+              if len(preview) > 2500:
+                  print(f"[turn {t}] MODEL RAW (first 2500 chars):\n{preview[:2500]}\n...[truncated]...", flush=True)
+              else:
+                  print(f"[turn {t}] MODEL RAW:\n{preview}", flush=True)
+
+              m = re.search(r"\{[\s\S]*\}", raw or "")
               if not m:
                   obs = "ERROR: respond with a single JSON action object"
+                  print(f"[turn {t}] PARSE FAIL: no JSON object in reply", flush=True)
                   messages.append({"role": "assistant", "content": raw})
                   messages.append({"role": "user", "content": obs})
-                  transcript.append({"turn": t, "raw": raw[:2000], "obs": obs})
+                  transcript.append({"turn": t, "raw": (raw or "")[:2000], "obs": obs})
                   continue
               try:
                   act = json.loads(m.group(0))
               except Exception as e:
                   obs = f"ERROR: invalid JSON ({e})"
+                  print(f"[turn {t}] PARSE FAIL: {obs}", flush=True)
+                  print(f"[turn {t}] JSON candidate: {m.group(0)[:500]}", flush=True)
                   messages.append({"role": "assistant", "content": raw})
                   messages.append({"role": "user", "content": obs})
-                  transcript.append({"turn": t, "raw": raw[:2000], "obs": obs})
+                  transcript.append({"turn": t, "raw": (raw or "")[:2000], "obs": obs})
                   continue
 
               action = (act.get("action") or "").lower()
+              print(f"[turn {t}] PARSED action={action!r} keys={list(act.keys())}", flush=True)
               obs = ""
               if action == "done":
                   obs = f"DONE: {act.get('reason','')}"
+                  print(f"[turn {t}] {obs}", flush=True)
                   messages.append({"role": "assistant", "content": raw})
                   transcript.append({"turn": t, "action": act, "obs": obs})
                   (turns_dir / f"turn_{t:03d}_obs.txt").write_text(obs)
                   break
               elif action == "bash":
                   cmd = act.get("cmd") or "echo empty"
-                  # light guardrails
+                  print(f"[turn {t}] BASH: {cmd!r}", flush=True)
                   if re.search(r"rm\s+-rf\s+/|shutdown|mkfs", cmd):
                       rc, obs = 1, "blocked dangerous command"
+                      print(f"[turn {t}] BLOCKED dangerous command", flush=True)
                   else:
                       try:
-                          rc, obs = run_bash(cmd)
+                          rc, out = run_bash(cmd)
                       except subprocess.TimeoutExpired:
-                          rc, obs = 124, "TIMEOUT"
-                      obs = f"rc={rc}\n{obs}"
+                          rc, out = 124, "TIMEOUT"
+                      obs = f"rc={rc}\n{out}"
+                      print(f"[turn {t}] BASH rc={rc} out_chars={len(out)}", flush=True)
+                      # show observation (truncate huge dumps)
+                      show = obs if len(obs) <= 3000 else obs[:3000] + "\n...[truncated]..."
+                      print(f"[turn {t}] OBSERVATION:\n{show}", flush=True)
               elif action == "write":
                   path = act.get("path") or "out.txt"
                   content = act.get("content") or ""
-                  # only allow under WORK or /tmp
                   dest = Path(path)
                   if not dest.is_absolute():
                       dest = WORK / dest
                   dest.parent.mkdir(parents=True, exist_ok=True)
                   dest.write_text(content)
                   obs = f"wrote {dest} bytes={len(content)}"
+                  print(f"[turn {t}] WRITE {dest} bytes={len(content)}", flush=True)
+                  if len(content) <= 500:
+                      print(f"[turn {t}] WRITE content:\n{content}", flush=True)
+                  else:
+                      print(f"[turn {t}] WRITE content preview:\n{content[:500]}\n...[truncated]...", flush=True)
               elif action == "docker_cp_to":
                   local = act.get("local") or ""
                   remote = act.get("remote") or "/workspace/x.js"
                   src = WORK / local if not Path(local).is_absolute() else Path(local)
+                  print(f"[turn {t}] DOCKER_CP {src} -> v8eval:{remote}", flush=True)
                   if not src.is_file():
                       obs = f"missing local file {src}"
+                      print(f"[turn {t}] {obs}", flush=True)
                   else:
                       rc, out = run_bash(f"docker cp {src} v8eval:{remote}")
                       obs = f"rc={rc}\n{out}"
+                      print(f"[turn {t}] docker cp rc={rc}\n{out}", flush=True)
               else:
                   obs = f"unknown action {action}; use bash|write|docker_cp_to|done"
+                  print(f"[turn {t}] {obs}", flush=True)
+                  print(f"[turn {t}] full act={act!r}", flush=True)
 
               (turns_dir / f"turn_{t:03d}_obs.txt").write_text(obs)
               messages.append({"role": "assistant", "content": raw})
               messages.append({"role": "user", "content": "OBSERVATION:\n" + obs[:12000]})
               transcript.append({"turn": t, "action": act, "obs": obs[:4000]})
-              # keep context bounded
+              print(f"[turn {t}] context_messages_now={len(messages)}", flush=True)
               if len(messages) > 30:
                   messages = [messages[0], messages[1]] + messages[-20:]
+                  print(f"[turn {t}] trimmed context to {len(messages)} messages", flush=True)
 
           (OUT / "transcript.json").write_text(json.dumps(transcript, indent=2))
-          print(f"Completed turns={len(transcript)}", flush=True)
+          print("", flush=True)
+          print("=" * 72, flush=True)
+          print(f"AGENT DONE turns_recorded={len(transcript)}", flush=True)
+          for i, row in enumerate(transcript):
+              if row.get("error"):
+                  print(f"  turn {i}: ERROR {row['error'][:120]}", flush=True)
+              else:
+                  act = row.get("action") or {}
+                  print(
+                      f"  turn {i}: action={act.get('action')!r} "
+                      f"obs_chars={len(row.get('obs') or '')}",
+                      flush=True,
+                  )
+          print("=" * 72, flush=True)
+
           PY
 
       - name: Capture container workspace snapshot
