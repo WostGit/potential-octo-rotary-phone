@@ -4059,14 +4059,28 @@ jobs:
           # Build Stage B script: poly PoC with crash stripped, probe appended so dump always finishes
           python3 - <<'PY'
           from pathlib import Path
-          import re
-          base = Path("/tmp/poc_test_poly.js").read_text()
-          # Remove final caged_write_unsafe(...) call so probe can complete with rc=0
-          base = re.sub(
-              r"caged_write_unsafe\s*\([^;]*\)\s*;?",
-              "/* caged_write_unsafe stripped for Stage B layout dump */",
-              base,
-          )
+
+          def base_without_stage4(p):
+              # Drop harness Stage 4 only. Do not regex-replace inside print() strings
+              # (that produced: print("[*] Stage 4: /* stripped ... and SyntaxError).
+              t = Path(p).read_text()
+              cut = None
+              for m in ('print("[*] Stage 4:', "print('[*] Stage 4:"):
+                  i = t.find(m)
+                  if i != -1:
+                      cut = i if cut is None else min(cut, i)
+              if cut is None:
+                  inst = t.find('builder.instantiate')
+                  j = t.find('\ncaged_write_unsafe(', inst if inst != -1 else 0)
+                  if j != -1:
+                      cut = j + 1
+              if cut is not None:
+                  t = t[:cut]
+              t = t.rstrip() + '\n'
+              t += 'print("[*] Stage 4 skipped (no-crash Stage B/C build)");\n'
+              return t
+
+          base = base_without_stage4("/tmp/poc_test_poly.js")
           probe = r"""
           // ===== STAGE B: layout / absolute R/W probe (no crash) =====
           (function stageB() {
@@ -4223,13 +4237,27 @@ jobs:
           fi
           python3 - <<'PY'
           from pathlib import Path
-          import re
-          base = Path("/tmp/poc_test_poly.js").read_text()
-          base = re.sub(
-              r"caged_write_unsafe\s*\([^;]*\)\s*;?",
-              "/* caged_write_unsafe stripped for Stage C exec probes */",
-              base,
-          )
+
+          def base_without_stage4(p):
+              # Drop harness Stage 4 only. Do not regex-replace inside print() strings.
+              t = Path(p).read_text()
+              cut = None
+              for m in ('print("[*] Stage 4:', "print('[*] Stage 4:"):
+                  i = t.find(m)
+                  if i != -1:
+                      cut = i if cut is None else min(cut, i)
+              if cut is None:
+                  inst = t.find('builder.instantiate')
+                  j = t.find('\ncaged_write_unsafe(', inst if inst != -1 else 0)
+                  if j != -1:
+                      cut = j + 1
+              if cut is not None:
+                  t = t[:cut]
+              t = t.rstrip() + '\n'
+              t += 'print("[*] Stage 4 skipped (no-crash Stage B/C build)");\n'
+              return t
+
+          base = base_without_stage4("/tmp/poc_test_poly.js")
           # Stage C matrix: probe everything useful for exec WITHOUT claiming success
           probe = r"""
           // ===== STAGE C: exec surface test matrix =====
