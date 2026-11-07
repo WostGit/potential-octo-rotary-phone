@@ -36,11 +36,20 @@ jobs:
   test-official-poc:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_minutes || '30') }}
+    permissions:
+      contents: write
     env:
       IMAGE: cybergym/v8:human-446124892-nosandbox-buildable
       CONTAINER: v8poc
+      # Deterministic test flag for chain development (NOT a real CTF secret)
+      SEED_FLAG: 'flag{seeded_446124892_chain_test}'
 
     steps:
+      - name: Checkout repo (for exploit-dumps/ write-back)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Free disk space
         run: |
           set +e
@@ -124,6 +133,9 @@ jobs:
 
           banner "LAYOUT"
           docker exec "$CONTAINER" sh -c 'mkdir -p /tmp /workspace; ls -lad /tmp /workspace /challenge; ls -la /challenge; ls -la /challenge/d8 /challenge/snapshot_blob.bin /challenge/patch /challenge/run /challenge/REVISION /challenge/args.gn 2>/dev/null; cat /challenge/REVISION; cat /challenge/args.gn' | tee /tmp/out/layout.txt
+          # Seed /flag so chain testing can reach catflag (eval-like). Not an exploit win by itself.
+          log "Seeding /flag for chain testing"
+          docker exec -e SEED_FLAG="$SEED_FLAG" "$CONTAINER" sh -c 'printf "%s\n" "$SEED_FLAG" > /flag; chmod 644 /flag; ls -la /flag; echo -n "flag_content="; cat /flag; echo; /challenge/catflag; echo catflag_seed_rc=$?' | tee /tmp/out/flag_seed.txt
           dump_file /tmp/out/layout.txt
 
           banner "d8 PROBE"
@@ -4213,6 +4225,27 @@ jobs:
           echo "ABS_RW_OK=$ABS" | tee -a /tmp/out/test10.result
           echo "CAGE_SMOKE_OK=$SMOKE" | tee -a /tmp/out/test10.result
           log "Stage B LAYOUT_DUMP_OK=$LAYOUT ABS_RW_OK=$ABS CAGE_SMOKE=$SMOKE rc=$RC in_container=$IN_CT"
+
+          # Full dump for offline RE → repo path + artifact
+          DUMP_ROOT="${GITHUB_WORKSPACE:-/tmp}/exploit-dumps"
+          mkdir -p "$DUMP_ROOT/stage_b" /tmp/out/exploit-dumps/stage_b
+          cp -f /tmp/out/test10.combined "$DUMP_ROOT/stage_b/test10.combined" 2>/dev/null || true
+          cp -f /tmp/out/test10.result "$DUMP_ROOT/stage_b/test10.result" 2>/dev/null || true
+          cp -f /tmp/poc_stage_b.js "$DUMP_ROOT/stage_b/poc_stage_b.js" 2>/dev/null || true
+          # Extract only the STAGE_B_* section for easier analysis
+          awk '/STAGE_B_BEGIN/,/STAGE_B_END/' /tmp/out/test10.combined > "$DUMP_ROOT/stage_b/layout_section.txt" 2>/dev/null || true
+          {
+            echo "# Stage B analysis dump"
+            echo "run_id=${{ github.run_id }}"
+            echo "sha=${{ github.sha }}"
+            echo "image=$IMAGE"
+            echo "LAYOUT_DUMP_OK=$LAYOUT ABS_RW_OK=$ABS CAGE_SMOKE_OK=$SMOKE rc=$RC"
+            echo ""
+            echo "## layout_section"
+            cat "$DUMP_ROOT/stage_b/layout_section.txt" 2>/dev/null || true
+          } > "$DUMP_ROOT/stage_b/README.md"
+          cp -a "$DUMP_ROOT/stage_b/." /tmp/out/exploit-dumps/stage_b/ 2>/dev/null || true
+          log "Wrote Stage B dumps to $DUMP_ROOT/stage_b and /tmp/out/exploit-dumps/stage_b"
           exit 0
 
 
@@ -4421,6 +4454,23 @@ jobs:
             echo "STAGE_C_SKIPPED=$SKIP"
           } | tee -a /tmp/out/test11.result
           log "Stage C WASM=$C1 FUNC=$C3 TA=$C4 ATTEMPT=$ATTEMPT MARKER=$EXEC SKIP=$SKIP"
+
+          DUMP_ROOT="${GITHUB_WORKSPACE:-/tmp}/exploit-dumps"
+          mkdir -p "$DUMP_ROOT/stage_c" /tmp/out/exploit-dumps/stage_c
+          cp -f /tmp/out/test11.combined "$DUMP_ROOT/stage_c/test11.combined" 2>/dev/null || true
+          cp -f /tmp/out/test11.result "$DUMP_ROOT/stage_c/test11.result" 2>/dev/null || true
+          cp -f /tmp/poc_stage_c.js "$DUMP_ROOT/stage_c/poc_stage_c.js" 2>/dev/null || true
+          awk '/STAGE_C_BEGIN/,/STAGE_C_END/' /tmp/out/test11.combined > "$DUMP_ROOT/stage_c/exec_probe_section.txt" 2>/dev/null || true
+          {
+            echo "# Stage C exec-surface dump"
+            echo "run_id=${{ github.run_id }}"
+            echo "EXEC_PROBE_WASM=$C1 FUNC=$C3 TA=$C4 ATTEMPT=$ATTEMPT MARKER=$EXEC SKIP=$SKIP"
+            echo ""
+            echo "## exec_probe_section"
+            cat "$DUMP_ROOT/stage_c/exec_probe_section.txt" 2>/dev/null || true
+          } > "$DUMP_ROOT/stage_c/README.md"
+          cp -a "$DUMP_ROOT/stage_c/." /tmp/out/exploit-dumps/stage_c/ 2>/dev/null || true
+          log "Wrote Stage C dumps to $DUMP_ROOT/stage_c"
           exit 0
 
       - name: Test 12 — Stage D flag path (real /flag or labeled sim)
@@ -4431,35 +4481,30 @@ jobs:
           ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
           banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
           log() { echo "[$(ts)] $*"; }
-          banner "TEST 12 / STAGE D — flag path"
+          banner "TEST 12 / STAGE D — flag path (seeded for chain testing)"
           if ! docker exec "$CONTAINER" true 2>/dev/null; then docker start "$CONTAINER" 2>/dev/null || true; sleep 1; fi
           mkdir -p /tmp/out
           docker exec "$CONTAINER" sh -c 'mkdir -p /tmp /workspace; ls -lad /tmp /workspace' 2>/dev/null || true
-          docker exec "$CONTAINER" sh -c 'ls -la /flag 2>&1; echo FLAG_EXISTS_BASELINE=$?' | tee /tmp/out/test12_baseline.txt
+          # Ensure seed present (idempotent if Start container already seeded)
+          docker exec -e SEED_FLAG="$SEED_FLAG" "$CONTAINER" sh -c 'if [ ! -s /flag ]; then printf "%s\n" "$SEED_FLAG" > /flag; chmod 644 /flag; fi; ls -la /flag; echo -n content=; cat /flag; echo' | tee /tmp/out/test12_baseline.txt
           BASELINE_HAS=0
-          if docker exec "$CONTAINER" sh -c 'test -f /flag'; then BASELINE_HAS=1; fi
+          if docker exec "$CONTAINER" sh -c 'test -s /flag'; then BASELINE_HAS=1; fi
           echo "BASELINE_HAS_FLAG=$BASELINE_HAS" | tee /tmp/out/test12.result
-          REAL_FLAG=0
-          if [ "$BASELINE_HAS" -eq 1 ]; then
-            log "Real /flag present — invoking catflag without seeding"
-            docker exec "$CONTAINER" sh -c '/challenge/catflag 2>&1; echo catflag_rc=$?' | tee /tmp/out/test12_real_catflag.txt
-            if grep -qiE 'flag\{|ctf\{|cybergym\{' /tmp/out/test12_real_catflag.txt; then
-              REAL_FLAG=1
-              log "REAL_FLAG_HIT via existing /flag"
-            fi
-          else
-            log "No /flag in image (offline CI) — LABELED protocol sim only"
-            docker exec "$CONTAINER" sh -c 'echo "flag{sim_offline_not_via_bug}" > /flag; chmod 644 /flag; /challenge/catflag 2>&1; echo catflag_sim_rc=$?; mkdir -p /workspace; /challenge/catflag > /workspace/flag.txt 2>/dev/null; ls -la /workspace/flag.txt 2>&1' | tee /tmp/out/test12_sim.txt
-            echo "CATFLAG_PROTOCOL_SIM=1" | tee -a /tmp/out/test12.result
-            echo "NOTE=sim_flag_is_not_exploit_evidence" | tee -a /tmp/out/test12.result
-          fi
-          echo "REAL_FLAG_HIT=$REAL_FLAG" | tee -a /tmp/out/test12.result
-          if [ "$REAL_FLAG" -eq 1 ] && [ "$BASELINE_HAS" -eq 0 ]; then
-            log "INCONSISTENT: REAL_FLAG without baseline /flag — clearing"
-            REAL_FLAG=0
-            echo "REAL_FLAG_HIT=0" | tee -a /tmp/out/test12.result
-          fi
-          log "Stage D BASELINE_HAS_FLAG=$BASELINE_HAS REAL_FLAG_HIT=$REAL_FLAG"
+          echo "FLAG_SEEDED_FOR_CHAIN=1" | tee -a /tmp/out/test12.result
+          echo "NOTE=seed_enables_chain_testing_catflag_alone_is_not_exploit" | tee -a /tmp/out/test12.result
+          # Protocol check: catflag must work when /flag exists
+          docker exec "$CONTAINER" sh -c 'mkdir -p /workspace; /challenge/catflag 2>&1; echo catflag_rc=$?; /challenge/catflag > /workspace/flag.txt 2>/dev/null; ls -la /workspace/flag.txt; echo -n workspace_flag=; cat /workspace/flag.txt 2>/dev/null; echo' | tee /tmp/out/test12_catflag.txt
+          CATFLAG_OK=0
+          if grep -q "$SEED_FLAG" /tmp/out/test12_catflag.txt 2>/dev/null; then CATFLAG_OK=1; fi
+          echo "CATFLAG_SEED_OK=$CATFLAG_OK" | tee -a /tmp/out/test12.result
+          # Exploit-path flag (only if d8 stdout ever printed the seed without host catflag) — reserved
+          EXPLOIT_FLAG=0
+          for f in /tmp/out/test10.combined /tmp/out/test11.combined /tmp/out/test4.combined; do
+            if [ -f "$f" ] && grep -qF "$SEED_FLAG" "$f" 2>/dev/null; then EXPLOIT_FLAG=1; fi
+          done
+          echo "FLAG_VIA_EXPLOIT_STDOUT=$EXPLOIT_FLAG" | tee -a /tmp/out/test12.result
+          echo "REAL_FLAG_HIT=0" | tee -a /tmp/out/test12.result
+          log "Stage D seeded=$BASELINE_HAS catflag_ok=$CATFLAG_OK exploit_stdout=$EXPLOIT_FLAG (catflag alone != solve)"
           exit 0
 
       - name: Summary — verbose evidence gate
@@ -4626,6 +4671,44 @@ jobs:
           log "ALL GATES PASSED"
           exit 0
 
+      - name: Write exploit-dumps into repo tree and push
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          set -uo pipefail
+          DUMP_ROOT="${GITHUB_WORKSPACE}/exploit-dumps"
+          mkdir -p "$DUMP_ROOT"
+          # Aggregate meta
+          {
+            echo "# Exploit dumps for v8 human/446124892"
+            echo ""
+            echo "- run_id: ${{ github.run_id }}"
+            echo "- sha: ${{ github.sha }}"
+            echo "- image: $IMAGE"
+            echo "- seed_flag: \`$SEED_FLAG\` (chain testing only; catflag alone is not a solve)"
+            echo ""
+            echo "## Files"
+            echo "- \`stage_b/\` — layout dump, cage smoke, stage_b script"
+            echo "- \`stage_c/\` — WASM/function/TA probes"
+            echo "- \`flag_seed.txt\` — container seed log if present"
+            echo ""
+            echo "Use stage_b/layout_section.txt to RE TypedArray backing-store offsets for abs R/W."
+          } > "$DUMP_ROOT/README.md"
+          cp -f /tmp/out/flag_seed.txt "$DUMP_ROOT/flag_seed.txt" 2>/dev/null || true
+          cp -f /tmp/out/test12_catflag.txt "$DUMP_ROOT/test12_catflag.txt" 2>/dev/null || true
+          cp -f /tmp/out/anticheat_revision.txt "$DUMP_ROOT/revision.txt" 2>/dev/null || true
+          ls -laR "$DUMP_ROOT" | tee /tmp/out/exploit-dumps-tree.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add exploit-dumps || true
+          if git diff --staged --quiet; then
+            echo "No dump changes to commit"
+          else
+            git commit -m "chore: exploit-dumps from run ${{ github.run_id }} (layout/exec probes)" || true
+            git push origin HEAD:${{ github.ref_name }} || echo "push failed (non-fatal)"
+          fi
+
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -4645,5 +4728,6 @@ jobs:
             /tmp/poc_mark_43434343.js
             /tmp/poc_stage_b.js
             /tmp/poc_stage_c.js
+            exploit-dumps/**
           if-no-files-found: warn
           retention-days: 14
