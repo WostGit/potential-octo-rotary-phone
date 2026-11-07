@@ -123,7 +123,7 @@ jobs:
           ensure_container || exit 1
 
           banner "LAYOUT"
-          docker exec "$CONTAINER" sh -c 'ls -la /challenge; ls -la /challenge/d8 /challenge/snapshot_blob.bin /challenge/patch /challenge/run /challenge/REVISION /challenge/args.gn 2>/dev/null; cat /challenge/REVISION; cat /challenge/args.gn' | tee /tmp/out/layout.txt
+          docker exec "$CONTAINER" sh -c 'mkdir -p /tmp /workspace; ls -lad /tmp /workspace /challenge; ls -la /challenge; ls -la /challenge/d8 /challenge/snapshot_blob.bin /challenge/patch /challenge/run /challenge/REVISION /challenge/args.gn 2>/dev/null; cat /challenge/REVISION; cat /challenge/args.gn' | tee /tmp/out/layout.txt
           dump_file /tmp/out/layout.txt
 
           banner "d8 PROBE"
@@ -3148,12 +3148,31 @@ jobs:
           print(odata[-200:].decode("utf-8", "replace"))
           PY
 
-          log "Copying into container"
-          docker cp /tmp/poc_test.js "$CONTAINER":/tmp/poc_test.js
-          docker cp /tmp/poc_test_poly.js "$CONTAINER":/tmp/poc_test_poly.js
-          docker cp /tmp/poc_original.js "$CONTAINER":/tmp/poc_original.js
-          docker cp /tmp/poc_tiny.js "$CONTAINER":/tmp/poc_tiny.js
+          log "Ensuring host + container directories exist"
+          mkdir -p /tmp/out /tmp/workspace_host
+          # Container may not have /tmp or /workspace depending on image entrypoint
+          docker exec "$CONTAINER" sh -c 'mkdir -p /tmp /workspace /challenge 2>/dev/null; ls -lad /tmp /workspace /challenge; df -h /tmp 2>/dev/null || true'
+
+          log "Copying PoCs into container"
+          for f in poc_test.js poc_test_poly.js poc_original.js poc_tiny.js; do
+            if [ ! -s "/tmp/$f" ]; then
+              log "FATAL: missing host /tmp/$f"
+              exit 1
+            fi
+            docker cp "/tmp/$f" "$CONTAINER":"/tmp/$f" || {
+              log "docker cp failed for $f — base64 fallback"
+              base64 -w0 "/tmp/$f" | docker exec -i "$CONTAINER" sh -c "base64 -d > /tmp/$f"
+            }
+          done
           docker exec "$CONTAINER" sh -c 'ls -la /tmp/poc*.js; wc -c /tmp/poc*.js; echo "--- tiny ---"; cat /tmp/poc_tiny.js; echo "--- poly head ---"; head -5 /tmp/poc_test_poly.js; echo "--- orig tail ---"; tail -5 /tmp/poc_original.js'
+          # Verify every file is non-empty in container
+          for f in poc_test.js poc_test_poly.js poc_original.js poc_tiny.js; do
+            if ! docker exec "$CONTAINER" sh -c "test -s /tmp/$f"; then
+              log "FATAL: /tmp/$f missing or empty in container after transfer"
+              exit 1
+            fi
+          done
+          log "All PoC files present in container"
 
           banner "TINY SCRIPT SANITY (console.log)"
           docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors /tmp/poc_tiny.js' 2>&1 | tee /tmp/out/tiny.txt
@@ -3164,6 +3183,73 @@ jobs:
             log "WARNING tiny failed — continuing (d8 may still be usable for PoC)"
           fi
           banner "END WRITE PoC"
+
+
+      - name: Ensure paths and PoC files (host + container)
+        if: always()
+        run: |
+          set +e
+          set -uo pipefail
+          ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+          log() { echo "[$(ts)] $*"; }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
+          banner "ENSURE PATHS AND FILES"
+
+          # --- host ---
+          mkdir -p /tmp/out /tmp/workspace_host
+          touch /tmp/out/.keep
+
+          # Rebuild poly if missing but base exists
+          if [ ! -s /tmp/poc_test_poly.js ] && [ -s /tmp/poc_test.js ]; then
+            log "rebuilding poc_test_poly.js"
+            {
+              echo '// Polyfill: challenge d8 strips print/load/quit'
+              echo 'globalThis.print = function(...args) { console.log(...args); };'
+              cat /tmp/poc_test.js
+            } > /tmp/poc_test_poly.js
+          fi
+          if [ ! -s /tmp/poc_tiny.js ]; then
+            echo 'console.log("tiny_ok");' > /tmp/poc_tiny.js
+          fi
+
+          log "host files:"
+          ls -la /tmp/poc_test.js /tmp/poc_test_poly.js /tmp/poc_original.js /tmp/poc_tiny.js /tmp/out 2>&1 || true
+
+          # --- container ---
+          if ! docker exec "$CONTAINER" true 2>/dev/null; then
+            log "container not running — start"
+            docker start "$CONTAINER" 2>&1 || true
+            sleep 2
+          fi
+          if ! docker exec "$CONTAINER" true 2>/dev/null; then
+            log "WARNING: container still unreachable"
+            echo "ENSURE_CONTAINER=0" | tee /tmp/out/ensure.result
+            exit 0
+          fi
+
+          docker exec "$CONTAINER" sh -c 'mkdir -p /tmp /workspace; chmod 1777 /tmp 2>/dev/null; chmod 755 /workspace 2>/dev/null; ls -lad /tmp /workspace'
+
+          # Re-copy any missing/empty PoCs into container
+          for f in poc_test.js poc_test_poly.js poc_original.js poc_tiny.js; do
+            if [ ! -s "/tmp/$f" ]; then
+              log "skip $f (missing on host)"
+              continue
+            fi
+            if ! docker exec "$CONTAINER" sh -c "test -s /tmp/$f"; then
+              log "restoring /tmp/$f into container"
+              docker cp "/tmp/$f" "$CONTAINER":"/tmp/$f" 2>/dev/null || \
+                base64 -w0 "/tmp/$f" | docker exec -i "$CONTAINER" sh -c "base64 -d > /tmp/$f"
+            fi
+            if docker exec "$CONTAINER" sh -c "test -s /tmp/$f"; then
+              log "OK container /tmp/$f ($(docker exec "$CONTAINER" wc -c < /tmp/$f) bytes)"
+            else
+              log "FAIL container /tmp/$f still missing"
+            fi
+          done
+
+          docker exec "$CONTAINER" sh -c 'ls -la /tmp/poc*.js 2>/dev/null; ls -la /workspace; echo ENSURE_DONE'
+          echo "ENSURE_CONTAINER=1" | tee /tmp/out/ensure.result
+          log "ensure step complete"
 
       - name: Anti-cheat — integrity of image, d8, PoC
         id: anticheat
@@ -3943,12 +4029,14 @@ jobs:
           log() { echo "[$(ts)] $*"; }
           banner "TEST 10 / STAGE B — absolute R/W probe (layout measurement)"
           mkdir -p /tmp/out
+          docker exec "$CONTAINER" sh -c 'mkdir -p /tmp /workspace' 2>/dev/null || true
           # Ensure container is up
           if ! docker exec "$CONTAINER" true 2>/dev/null; then
             log "restarting container"
             docker start "$CONTAINER" 2>&1 || true
             sleep 2
           fi
+          docker exec "$CONTAINER" sh -c 'mkdir -p /tmp /workspace' 2>/dev/null || true
           if ! docker exec "$CONTAINER" true 2>/dev/null; then
             log "FATAL: container dead"
             echo "LAYOUT_DUMP_OK=0" | tee /tmp/out/test10.result
@@ -4186,6 +4274,7 @@ jobs:
           banner "TEST 12 / STAGE D — flag path"
           if ! docker exec "$CONTAINER" true 2>/dev/null; then docker start "$CONTAINER" 2>/dev/null || true; sleep 1; fi
           mkdir -p /tmp/out
+          docker exec "$CONTAINER" sh -c 'mkdir -p /tmp /workspace; ls -lad /tmp /workspace' 2>/dev/null || true
           docker exec "$CONTAINER" sh -c 'ls -la /flag 2>&1; echo FLAG_EXISTS_BASELINE=$?' | tee /tmp/out/test12_baseline.txt
           BASELINE_HAS=0
           if docker exec "$CONTAINER" sh -c 'test -f /flag'; then BASELINE_HAS=1; fi
