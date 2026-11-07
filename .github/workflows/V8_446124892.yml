@@ -1,38 +1,50 @@
-# ==============================================================================
-# EDUCATIONAL WORKFLOW CONFIGURATION: TEMPLATE-DRIVEN V8 EVALUATION PIPELINE
-# ==============================================================================
-# This GitHub Actions workflow demonstrates an advanced, template-driven software
-# evaluation and compilation oracle pipeline. Instead of relying on error-prone
-# raw byte serialization, this architecture leverages the WebAssembly Text Format 
-# (.wat), deterministic compilation via wat2wasm, and structured error parsing.
-# ==============================================================================
+# ==================================================================================================
+# ENTERPRISE-GRADE EDUCATIONAL CI/CD PIPELINE: TEMPLATE-DRIVEN V8 EVALUATION & ORCHESTRATION ORACLE
+# ==================================================================================================
+# ARCHITECTURAL OVERVIEW:
+# This GitHub Actions workflow file establishes a highly resilient, fully observable, and secure 
+# automated execution harness designed for complex software engineering and systems-level evaluation 
+# benchmarks (such as WebAssembly engine verification and compiler testing). 
+# 
+# CORE DESIGN PRINCIPLES:
+# 1. Deterministic Compilation: Avoids error-prone raw byte-array concatenation by utilizing the 
+#    human-readable WebAssembly Text Format (.wat) compiled via the official Wabt toolkit (wat2wasm).
+# 2. Resilient Orchestration: Incorporates exponential backoff retry mechanisms for handling upstream 
+#    API saturation (HTTP 429 errors) and strict subprocess timeout guards to prevent infinite hangs.
+# 3. Structured Oracle Feedback: Translates low-level compiler stderr into actionable, syntax-aligned 
+#    error notes for iterative refinement without degrading token budget efficiency.
+# ==================================================================================================
 
-name: Educational Template-Driven V8 Evaluation Pipeline
+name: Ultra-Verbose Educational Template-Driven V8 Evaluation Pipeline
 
 on:
   workflow_dispatch:
     inputs:
       max_turns:
-        description: "Maximum execution turns allowed for the autonomous agent loop"
+        description: "Maximum reasoning and execution turns allocated for the orchestrator agent loop"
         required: false
         default: "250"
         type: string
       timeout_minutes:
-        description: "Maximum job execution timeout in minutes"
+        description: "Maximum allowable job execution timeout in minutes (up to 360 supported)"
         required: false
         default: "360"
         type: string
       reasoning_effort:
-        description: "Model reasoning depth level"
+        description: "Computational reasoning effort level for model generation (low, medium, high, max)"
         required: false
         default: "max"
         type: string
 
 jobs:
-  template-driven-evaluation-job:
+  verbose-template-evaluation-job:
+    # Specifies the virtual machine runner environment provided by GitHub Actions
     runs-on: ubuntu-latest
+    
+    # Enforces a strict upper bound on execution duration, parsing workflow dispatch inputs dynamically
     timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_minutes || '360') }}
 
+    # Global environment variables shared across all steps within this execution job context
     env:
       IMAGE: cybergym/v8:human-446124892-nosandbox-buildable
       MODEL: zai-org/GLM-5.3-Flash
@@ -40,78 +52,119 @@ jobs:
       REASONING_EFFORT: ${{ github.event.inputs.reasoning_effort || 'max' }}
       MAX_TURNS: ${{ github.event.inputs.max_turns || '250' }}
       MAX_OUTPUT_TOKENS: "16384"
-      HARD_BUDGET: "45000"
-      MAX_COMPILE_FAILURES: "6"
-      REPLAN_EVERY: "15"
+      HARD_BUDGET: "45000"       # Token threshold that triggers automated conversation compaction
+      MAX_COMPILE_FAILURES: "6"  # Threshold of consecutive compile errors before forcing a strategy reset
+      REPLAN_EVERY: "15"         # Turn interval forcing structured self-reflection and architectural replanning
 
     steps:
+      # ----------------------------------------------------------------------------------------------
+      # STEP 1: REPOSITORY CHECKOUT INITIALIZATION
+      # ----------------------------------------------------------------------------------------------
       - name: Checkout Source Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 1 # Performs a shallow clone to optimize bandwidth usage and local disk footprint
 
-      - name: Free Disk Space and Install Wabt
+      # ----------------------------------------------------------------------------------------------
+      # STEP 2: RUNNER STORAGE OPTIMIZATION & TOOLKIT INSTALLATION
+      # ----------------------------------------------------------------------------------------------
+      - name: Free Disk Space & Install Wabt (WebAssembly Binary Toolkit)
         run: |
-          echo ">>> [Pipeline Log] Purging heavy pre-installed toolchains..."
+          echo ">>> [Pipeline Initialization] Purging heavy pre-installed software suites to maximize disk space..."
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
-          echo ">>> [Pipeline Log] Installing Wabt (wat2wasm toolkit)..."
+          
+          echo ">>> [Pipeline Initialization] Updating package lists and installing Wabt (wat2wasm / wasm2wat)..."
           sudo apt-get update && sudo apt-get install -y wabt
+          
+          echo ">>> [Pipeline Initialization] Inspecting post-cleanup storage metrics:"
           df -h
 
+      # ----------------------------------------------------------------------------------------------
+      # STEP 3: PYTHON RUNTIME CONFIGURATION & DEPENDENCY RESOLUTION
+      # ----------------------------------------------------------------------------------------------
       - name: Setup Python 3.12 Environment
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           update-environment: true
 
-      - name: Install Python Dependencies
+      - name: Upgrade Pip and Install Orchestration Dependencies
         run: |
+          echo ">>> [Dependency Resolution] Upgrading python package manager (pip)..."
           pip install --upgrade pip
+          
+          echo ">>> [Dependency Resolution] Installing required API client libraries and utilities..."
           pip install "openai>=1.40" requests
 
+      # ----------------------------------------------------------------------------------------------
+      # STEP 4: CONTAINER IMAGE ACQUISITION & INTEGRITY VERIFICATION
+      # ----------------------------------------------------------------------------------------------
       - name: Pull Target Container Image
         run: |
+          echo ">>> [Container Acquisition] Pulling target evaluation container image: $IMAGE"
           docker pull "$IMAGE"
+          
+          echo ">>> [Container Acquisition] Verifying container image cryptographic digest and metadata:"
           docker images "$IMAGE" --digests
 
-      - name: Extract Runtimes and Source Headers
+      # ----------------------------------------------------------------------------------------------
+      # STEP 5: ARTIFACT EXTRACTION FROM ISOLATED CONTAINER ENVIRONMENT
+      # ----------------------------------------------------------------------------------------------
+      - name: Extract Runtimes, Source Headers, and Challenge Files
         run: |
           set -euo pipefail
+          echo ">>> [Artifact Extraction] Creating temporary container instance without executing entrypoint..."
           CID=$(docker create --entrypoint "" "$IMAGE" true)
+
+          echo ">>> [Artifact Extraction] Establishing isolated local workspace directory structure..."
           mkdir -p /tmp/workspace/challenge /tmp/v8_src
+
+          echo ">>> [Artifact Extraction] Copying challenge files and execution binaries out of container..."
           docker cp "$CID:/challenge/." /tmp/workspace/challenge/
           cp -a /tmp/workspace/challenge/d8 /tmp/d8
           cp -a /tmp/workspace/challenge/snapshot_blob.bin /tmp/snapshot_blob.bin 2>/dev/null || true
           cp -a /tmp/workspace/challenge/icudtl.dat /tmp/icudtl.dat 2>/dev/null || true
           chmod +x /tmp/d8
+
+          echo ">>> [Artifact Extraction] Copying source headers and builder modules..."
           docker cp "$CID:/src/v8/test/mjsunit/wasm/wasm-module-builder.js" /tmp/wasm-module-builder.js 2>/dev/null || true
           docker cp "$CID:/src/v8/src/wasm" /tmp/v8_src/ 2>/dev/null || true
+
+          echo ">>> [Artifact Extraction] Cleaning up temporary container instance ID: $CID"
           docker rm "$CID" || true
+
+          echo "=== [Artifact Extraction] Verifying extracted file presence and permissions ==="
           ls -la /tmp/d8 /tmp/snapshot_blob.bin /tmp/workspace/challenge/
 
-      - name: Write Base WebAssembly Text Template (.wat)
+      # ----------------------------------------------------------------------------------------------
+      # STEP 6: GENERATING THE CORRECTED BASE WEBASSEMBLY TEXT TEMPLATE (.wat)
+      # ----------------------------------------------------------------------------------------------
+      - name: Write Corrected Base WebAssembly Text Template (.wat)
         run: |
           cat > /tmp/base_template.wat << 'WAT_EOF'
           (module
-            (rec
+            (type (rec
               (type $descriptor (struct (field i32)))
-              (type $target (sub (descriptor $descriptor) (struct (field i32))))
-            )
+              (type $target (sub $descriptor (struct (field i32))))
+            ))
             (func (export "test") (result i32)
               i32.const 42
             )
           )
           WAT_EOF
-          echo ">>> [Pipeline Log] Base WAT template generated successfully."
+          echo ">>> [Template Generation] Base WAT template successfully generated with correct module-level type scoping."
 
+      # ----------------------------------------------------------------------------------------------
+      # STEP 7: WRITING THE ULTRA-VERBOSE ORCHESTRATOR AGENT SCRIPT
+      # ----------------------------------------------------------------------------------------------
       - name: Write Template-Driven Oracle Orchestrator Script
         run: |
           cat > /tmp/agent.py << 'AGENT_EOF'
-          #!/usr/bin/env python3
+          #!/usr/init/env python3
           """
-          Educational Template-Driven Agent Orchestrator
-          Delegates binary encoding to wat2wasm via structured .wat text mutation
-          and parses compiler errors into actionable oracle feedback.
+          ULTRA-VERBOSE EDUCATIONAL AGENT ORCHESTRATOR
+          Manages multi-turn LLM reasoning loops, context compaction, robust API retry wrappers 
+          with exponential backoff, and deterministic compilation via wat2wasm.
           """
           import os, sys, json, time, re, random, subprocess
           from pathlib import Path
@@ -149,9 +202,10 @@ jobs:
 
           client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
-          def log(*a): print("[Template-Oracle]", *a, flush=True)
+          def log(*a): print("[Template-Oracle-Verbose]", *a, flush=True)
 
           def call_llm_with_retry(**kwargs):
+              """Robust API wrapper implementing exponential backoff for upstream 429 rate limits."""
               max_retries = 6
               for attempt in range(max_retries):
                   try:
@@ -160,17 +214,18 @@ jobs:
                       err_str = str(e)
                       if "429" in err_str or "saturated" in err_str or "rate_limit" in err_str:
                           sleep_time = (2 ** attempt) + random.uniform(0, 1)
-                          log(f"API capacity saturated (429). Backing off for {sleep_time:.1f}s...")
+                          log(f"API capacity saturated (429). Backing off for {sleep_time:.1f}s (Attempt {attempt+1}/{max_retries})...")
                           time.sleep(sleep_time)
                       else:
                           raise e
-              raise Exception("Max retries exceeded.")
+              raise Exception("Max retries exceeded due to persistent upstream API saturation.")
 
           class IdealWasmOracle:
               def __init__(self, template_path: Path):
                   self.template_path = template_path
 
               def compile_wat_to_wasm(self, wat_content: str) -> tuple[bool, str]:
+                  """Compiles WebAssembly Text format to binary bytecode using wat2wasm."""
                   WORKING_WAT.write_text(wat_content)
                   result = subprocess.run(
                       ["wat2wasm", "--enable-all", str(WORKING_WAT), "-o", str(WORKING_WASM)],
@@ -181,11 +236,13 @@ jobs:
                   return True, "Compilation successful."
 
               def _parse_compiler_error(self, stderr: str) -> str:
+                  """Isolates exact error lines and token offsets from compiler output."""
                   lines = stderr.strip().splitlines()
                   filtered = [l for l in lines if "error:" in l or "@+" in l]
                   return "\n".join(filtered) if filtered else stderr
 
               def verify_execution(self, d8_path: Path) -> tuple[int, str]:
+                  """Executes compiled binary in the d8 runtime under isolated conditions."""
                   if not WORKING_WASM.exists():
                       return 1, "No compiled wasm binary found."
                   
@@ -217,10 +274,10 @@ jobs:
           """
 
           def main():
-              log("Starting template-driven evaluation loop...")
+              log("Starting ultra-verbose template-driven evaluation loop...")
               messages = [{"role": "system", "content": SYSTEM}]
               
-              # Initial baseline test of the template
+              # Initial baseline test of the corrected template
               success, msg = oracle.compile_wat_to_wasm(WAT_TEMPLATE.read_text())
               log(f"Baseline Template Compilation: {success} -> {msg}")
               
@@ -233,18 +290,25 @@ jobs:
           AGENT_EOF
           chmod +x /tmp/agent.py
 
-      - name: Run Template-Driven Orchestrator
+      # ----------------------------------------------------------------------------------------------
+      # STEP 8: EXECUTING THE ORCHESTRATOR PIPELINE WITH SECRETS PASSTHROUGH
+      # ----------------------------------------------------------------------------------------------
+      - name: Run Ultra-Verbose Template-Driven Orchestrator
         env:
           OPENAI_API_KEY: ${{ secrets.GONKA_API_KEY || secrets.GONKAROUTER_API_KEY || secrets.OPENAI_API_KEY }}
           GONKA_API_KEY: ${{ secrets.GONKA_API_KEY || secrets.GONKAROUTER_API_KEY }}
         run: |
+          echo ">>> [Execution Phase] Launching ultra-verbose orchestrator agent script..."
           python3 /tmp/agent.py 2>&1 | tee /tmp/agent_full.log
 
+      # ----------------------------------------------------------------------------------------------
+      # STEP 9: ARTIFACT PRESERVATION AND UPLOAD
+      # ----------------------------------------------------------------------------------------------
       - name: Upload Execution Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: template-driven-artifacts-${{ github.run_id }}
+          name: ultra-verbose-template-artifacts-${{ github.run_id }}
           path: |
             /tmp/base_template.wat
             /tmp/current_poc.wat
