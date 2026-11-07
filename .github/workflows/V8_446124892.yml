@@ -4033,8 +4033,8 @@ jobs:
 
 
 
-      - name: Test 10 — Stage B d=32 OOB + header pivot discovery
-        id: stage_b
+      - name: Test 10a — Build Stage B script (d=32 + header pivot)
+        id: stage_b_build
         run: |
           set +e
           set -uo pipefail
@@ -4480,6 +4480,26 @@ jobs:
             echo "ABS_RW_OK=0" | tee -a /tmp/out/test10.result
             exit 0
           fi
+          log "Stage B script built bytes=$(wc -c < /tmp/poc_stage_b.js)"
+          exit 0
+
+      - name: Test 10b — Run Stage B + collect dumps
+        id: stage_b
+        run: |
+          set +e
+          set -uo pipefail
+          ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
+          log() { echo "[$(ts)] $*"; }
+          banner "TEST 10b / STAGE B — transfer, run, parse"
+          mkdir -p /tmp/out
+          if [ ! -f /tmp/poc_stage_b.js ]; then
+            log "FATAL: missing /tmp/poc_stage_b.js from build step"
+            echo "LAYOUT_DUMP_OK=0" | tee /tmp/out/test10.result
+            echo "ABS_RW_OK=0" | tee -a /tmp/out/test10.result
+            echo "test10_rc=97" | tee -a /tmp/out/test10.result
+            exit 0
+          fi
           log "host stage_b sha256=$(sha256sum /tmp/poc_stage_b.js | awk '{print $1}') bytes=$(wc -c < /tmp/poc_stage_b.js)"
           # Transfer: docker cp, verify; fallback base64 pipe
           docker cp /tmp/poc_stage_b.js "$CONTAINER":/tmp/poc_stage_b.js 2>&1 | tee /tmp/out/test10_cp.txt
@@ -4568,6 +4588,7 @@ jobs:
           cp -a "$DUMP_ROOT/stage_b/." /tmp/out/exploit-dumps/stage_b/ 2>/dev/null || true
           log "Wrote Stage B dumps to $DUMP_ROOT/stage_b and /tmp/out/exploit-dumps/stage_b"
           exit 0
+
 
 
       - name: Test 11 — Stage C exec surface probes (honest matrix)
