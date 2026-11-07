@@ -372,23 +372,58 @@ jobs:
               {"role": "user", "content": task + "\n\n" + tools + "\n\nBegin. First inspect /challenge in the container."},
           ]
 
-          client = OpenAI(base_url=BASE_URL, api_key=KEY, timeout=300.0, max_retries=1)
+          client = OpenAI(base_url=BASE_URL, api_key=KEY, timeout=300.0, max_retries=0)
 
-          def chat(msgs):
+          def is_retryable(err):
+              s = str(err).lower()
+              code = getattr(err, "status_code", None) or getattr(getattr(err, "response", None), "status_code", None)
+              if code in (429, 500, 502, 503, 504):
+                  return True
+              if "429" in s or "capacity" in s or "saturated" in s or "rate limit" in s:
+                  return True
+              if "timeout" in s or "temporar" in s or "unavailable" in s:
+                  return True
+              return False
+
+          def chat(msgs, max_attempts=8):
+              """Call Gonka with exponential backoff on 429/capacity and other transient errors."""
               kwargs = dict(
                   model=MODEL,
                   messages=msgs,
                   temperature=0.2,
                   max_tokens=2048,
               )
-              # Gonka / GLM may accept reasoning_effort; ignore if unsupported
-              try:
-                  return client.chat.completions.create(
-                      **kwargs,
-                      extra_body={"reasoning_effort": REASONING_EFFORT},
-                  ).choices[0].message.content or ""
-              except Exception:
-                  return client.chat.completions.create(**kwargs).choices[0].message.content or ""
+              last = None
+              for attempt in range(1, max_attempts + 1):
+                  try:
+                      try:
+                          resp = client.chat.completions.create(
+                              **kwargs,
+                              extra_body={"reasoning_effort": REASONING_EFFORT},
+                          )
+                      except TypeError:
+                          # SDK/router may not accept extra_body
+                          resp = client.chat.completions.create(**kwargs)
+                      except Exception as e1:
+                          # reasoning_effort unsupported or other; retry plain once in same attempt
+                          if "reasoning" in str(e1).lower() or "extra_body" in str(e1).lower() or "unexpected" in str(e1).lower():
+                              resp = client.chat.completions.create(**kwargs)
+                          else:
+                              raise e1
+                      return resp.choices[0].message.content or ""
+                  except Exception as e:
+                      last = e
+                      if attempt >= max_attempts or not is_retryable(e):
+                          raise
+                      # exponential backoff: 5, 10, 20, 40, 60, 60, 60... capped
+                      delay = min(60, 5 * (2 ** (attempt - 1)))
+                      print(
+                          f"API retryable error attempt {attempt}/{max_attempts}; "
+                          f"sleep {delay}s: {e}",
+                          flush=True,
+                      )
+                      time.sleep(delay)
+              raise last
 
           def run_bash(cmd, timeout=120):
               p = subprocess.run(
@@ -409,9 +444,18 @@ jobs:
                   raw = chat(messages)
               except Exception as e:
                   err = f"API_ERROR: {e}"
+                  print(err, flush=True)
                   (turns_dir / f"turn_{t:03d}.txt").write_text(err)
                   transcript.append({"turn": t, "error": err})
-                  break
+                  # one extra long cooldown then continue to next turn if early;
+                  # only abort if we keep failing
+                  fail_count = sum(1 for x in transcript if x.get("error"))
+                  if fail_count >= 3:
+                      print("Too many consecutive API failures; aborting agent loop.", flush=True)
+                      break
+                  print("Cooling down 90s before next turn...", flush=True)
+                  time.sleep(90)
+                  continue
 
               (turns_dir / f"turn_{t:03d}_model.txt").write_text(raw)
               # parse JSON object
