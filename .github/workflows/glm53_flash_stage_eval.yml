@@ -403,8 +403,8 @@ jobs:
           transcript = []
           for t in range(MAX):
               if t == 0:
-              print(f"MODEL={MODEL} BASE_URL={BASE_URL} REASONING_EFFORT={REASONING_EFFORT} MAX_TURNS={MAX}", flush=True)
-          print(f"=== TURN {t} ===", flush=True)
+                  print(f"MODEL={MODEL} BASE_URL={BASE_URL} REASONING_EFFORT={REASONING_EFFORT} MAX_TURNS={MAX}", flush=True)
+              print(f"=== TURN {t} ===", flush=True)
               try:
                   raw = chat(messages)
               except Exception as e:
