@@ -344,7 +344,12 @@ jobs:
                   raise ValueError("multiple JSON objects")
               return obj
 
-          def is_real_segv(out):
+          def is_real_segv(out, source):
+              # Only live /challenge/d8 stdout/stderr. Bash that prints
+              # pov/reproduced_output.txt also contains "Received signal 11"
+              # and must not set seen_segv.
+              if source != "d8":
+                  return False
               return bool(re.search(r"Received signal\s+11|SEGV @|#\s*Received signal|ENGINE_CRASH", out or ""))
 
           snap_lock = threading.Lock()
@@ -562,9 +567,6 @@ jobs:
                   cmd = act.get("cmd") or ""
                   rc, out = run_bash(cmd)
                   obs = f"rc={rc}\n{out}"
-                  if is_real_segv(out):
-                      seen_segv = True
-                      log("SEGV detected → seen_segv=True")
 
               elif action == "write":
                   path = act.get("path") or "exp.js"
@@ -597,7 +599,7 @@ jobs:
                       agent_d8_runs += 1
                   obs = f"rc={rc}\n{out}"
                   (turns_dir / f"turn_{t:03d}_d8.txt").write_text(obs)
-                  if is_real_segv(out):
+                  if is_real_segv(out, "d8"):
                       seen_segv = True
                       log("SEGV detected → seen_segv=True")
                   current_state.update({
