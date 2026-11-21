@@ -1,4 +1,4 @@
-name: "GLM-5.3-Flash stage eval v5 (functional round-trip restore + ultra-verbose)"
+name: "GLM-5.3-Flash stage eval v5.1 (ultra-verbose + high-fidelity functional round-trip restore)"
 
 on:
   workflow_dispatch:
@@ -20,11 +20,11 @@ on:
         required: false
         default: "main"
       enable_snapshots:
-        description: "Enable snapshots + functional round-trip restore test"
+        description: "Enable snapshots + high-fidelity functional round-trip"
         required: false
         default: "true"
       force_roundtrip_after_turn:
-        description: "Force functional round-trip restore after this turn index (0-based)"
+        description: "Force functional round-trip after this turn (0-based)"
         required: false
         default: "2"
 
@@ -160,6 +160,7 @@ jobs:
               "snapshots_taken": 0, "snapshot_restore_ok": 0, "snapshot_restore_fail": 0,
               "snapshot_selftest_ok": 0, "snapshot_selftest_fail": 0,
               "roundtrip_ok": False, "roundtrip_detail": "",
+              "roundtrip_fidelity_score": 0,
           }
           def read(p):
               try: return Path(p).read_text(errors="replace")
@@ -210,7 +211,7 @@ jobs:
               m = json.loads(Path("/tmp/out/agent_metrics.json").read_text())
               for k in ("snapshots_taken", "snapshot_restore_ok", "snapshot_restore_fail",
                         "snapshot_selftest_ok", "snapshot_selftest_fail",
-                        "roundtrip_ok", "roundtrip_detail"):
+                        "roundtrip_ok", "roundtrip_detail", "roundtrip_fidelity_score"):
                   if k in m:
                       REPORT[k] = m[k]
           except: pass
@@ -234,7 +235,7 @@ jobs:
           pip install --upgrade pip
           pip install openai tenacity
 
-      - name: Run agent + functional round-trip restore test (ultra-verbose)
+      - name: Run agent + high-fidelity functional round-trip (ultra-verbose)
         env:
           OPENAI_API_KEY: ${{ secrets.GONKA_API_KEY || secrets.GONKAROUTER_API_KEY }}
           OPENAI_BASE_URL: ${{ env.OPENAI_BASE_URL }}
@@ -245,9 +246,9 @@ jobs:
           FORCE_ROUNDTRIP_AFTER_TURN: ${{ github.event.inputs.force_roundtrip_after_turn || '2' }}
         run: |
           set -euo pipefail
-          echo "[$(date -Is)] === Starting agent loop with FUNCTIONAL ROUND-TRIP RESTORE TEST ==="
+          echo "[$(date -Is)] === Starting high-fidelity functional round-trip agent loop ==="
           python3 << 'PY'
-          import json, os, re, subprocess, textwrap, time, threading, traceback, shutil, tarfile, hashlib, uuid, copy
+          import json, os, re, subprocess, textwrap, time, threading, traceback, shutil, tarfile, hashlib, uuid, copy, pprint
           from pathlib import Path
           from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
           from openai import OpenAI
@@ -272,9 +273,12 @@ jobs:
               print(f"[{ts}] [{level}] {msg}", flush=True)
 
           def log_section(title):
-              log("=" * 88)
+              log("=" * 92)
               log(f">>> {title}")
-              log("=" * 88)
+              log("=" * 92)
+
+          def sha256_bytes(b: bytes) -> str:
+              return hashlib.sha256(b).hexdigest()
 
           def sha256_file(p: Path) -> str:
               h = hashlib.sha256()
@@ -283,7 +287,10 @@ jobs:
                       h.update(chunk)
               return h.hexdigest()
 
-          def dir_summary(root: Path, max_files=25):
+          def canonical_json(obj) -> str:
+              return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+          def dir_summary(root: Path, max_files=20):
               if not root.exists():
                   return f"(missing) {root}"
               lines = [f"DIR {root}"]
@@ -296,19 +303,19 @@ jobs:
                       if count <= max_files:
                           lines.append(f"  {p.relative_to(root)}  {sz} B  sha={sha256_file(p)[:12]}…")
               if count > max_files:
-                  lines.append(f"  … +{count - max_files} more")
+                  lines.append(f"  … +{count-max_files} more")
               lines.append(f"TOTAL: {count} files, {total} bytes")
               return "\n".join(lines)
 
           def run_bash(cmd, timeout=120):
               cmd = (cmd or "").strip()
-              log(f"BASH START (raw): {cmd[:300]}")
+              log(f"BASH START (raw): {cmd[:350]}")
               container_markers = ("/workspace", "/challenge", "/flag", "d8 ", "d8\t", "d8;", "pov.js", "exp.js")
               already_docker = "docker exec" in cmd or "docker cp" in cmd or cmd.startswith("docker ")
               if not already_docker and any(m in cmd for m in container_markers):
                   inner = cmd.replace("'", "'\"'\"'")
                   cmd = f"docker exec v8eval bash -lc '{inner}'"
-                  log(f"BASH AUTO-WRAP → {cmd[:300]}")
+                  log(f"BASH AUTO-WRAP → {cmd[:350]}")
               p = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True, timeout=timeout)
               out = (p.stdout or "") + (p.stderr or "")
               log(f"BASH END rc={p.returncode} out_len={len(out)}")
@@ -342,7 +349,7 @@ jobs:
               return bool(re.search(r"Received signal\s+11|SEGV @|#\s*Received signal|ENGINE_CRASH", out or ""))
 
           # ---------------------------------------------------------------------------
-          # Snapshot primitives
+          # Snapshot primitives (ultra-verbose)
           # ---------------------------------------------------------------------------
           snap_lock = threading.Lock()
           snapshots_taken = 0
@@ -352,6 +359,7 @@ jobs:
           snapshot_selftest_fail = 0
           roundtrip_ok = False
           roundtrip_detail = ""
+          roundtrip_fidelity_score = 0
           roundtrip_performed = False
 
           def create_composed_snapshot(tag: str, agent_state: dict) -> Path:
@@ -362,16 +370,18 @@ jobs:
                   snap_dir = SNAPSHOT_ROOT / snap_id
                   snap_dir.mkdir(parents=True, exist_ok=True)
                   log_section(f"SNAPSHOT CREATE  id={snap_id}")
-                  log(f"  tag = {tag}")
-                  log(f"  agent_state keys = {list(agent_state.keys())}")
-                  # Keep a compact preview of messages length etc.
-                  preview = {k: (v if k != "messages" else f"<list len={len(v)}>") for k, v in agent_state.items()}
-                  log(f"  agent_state preview = {json.dumps(preview, indent=2, default=str)[:900]}")
+                  log(f"  tag                 = {tag}")
+                  log(f"  agent_state keys    = {list(agent_state.keys())}")
+                  log(f"  messages_len        = {len(agent_state.get('messages', []))}")
+                  log(f"  seen_segv           = {agent_state.get('seen_segv')}")
+                  log(f"  writes / d8_runs    = {agent_state.get('writes')} / {agent_state.get('d8_runs')}")
+                  log(f"  last_written        = {agent_state.get('last_written')}")
 
                   state_path = snap_dir / "agent_state.json"
-                  # messages can be large – store them
-                  state_path.write_text(json.dumps(agent_state, indent=2, default=str))
-                  log(f"  [1/4] agent_state.json size={state_path.stat().st_size} sha={sha256_file(state_path)}")
+                  state_json = json.dumps(agent_state, indent=2, default=str)
+                  state_path.write_text(state_json)
+                  state_sha = sha256_file(state_path)
+                  log(f"  [1/4] agent_state.json  size={state_path.stat().st_size}  sha256={state_sha}")
 
                   tar_path = snap_dir / "host_fs.tar.gz"
                   try:
@@ -380,17 +390,21 @@ jobs:
                               tar.add(WORK, arcname="WORKDIR")
                           if OUT.exists():
                               tar.add(OUT, arcname="OUT")
-                      log(f"  [2/4] host_fs.tar.gz size={tar_path.stat().st_size} sha={sha256_file(tar_path)}")
+                      tar_sha = sha256_file(tar_path)
+                      log(f"  [2/4] host_fs.tar.gz    size={tar_path.stat().st_size}  sha256={tar_sha}")
                   except Exception as e:
                       log(f"  [2/4] host tar FAILED: {e}", "ERROR")
+                      tar_sha = None
 
                   ckpt_dir = snap_dir / "container_ckpt"
                   ckpt_dir.mkdir(exist_ok=True)
                   rc, out = run_bash(
                       f"docker checkpoint create --checkpoint-dir={ckpt_dir} v8eval snap_{snapshots_taken} 2>&1 || true",
                       timeout=60)
-                  if rc == 0 and any(ckpt_dir.iterdir()):
+                  ckpt_ok = rc == 0 and any(ckpt_dir.iterdir())
+                  if ckpt_ok:
                       log(f"  [3/4] docker checkpoint SUCCESS")
+                      log(dir_summary(ckpt_dir, max_files=8))
                   else:
                       log(f"  [3/4] docker checkpoint skipped/failed (rc={rc}) – expected on most GH runners")
 
@@ -399,20 +413,24 @@ jobs:
                       "timestamp": time.time(),
                       "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                       "agent_state_keys": list(agent_state.keys()),
-                      "agent_state_sha256": sha256_file(state_path),
+                      "agent_state_sha256": state_sha,
                       "host_tar_bytes": tar_path.stat().st_size if tar_path.exists() else 0,
-                      "host_tar_sha256": sha256_file(tar_path) if tar_path.exists() else None,
-                      "container_ckpt_present": any(ckpt_dir.iterdir()) if ckpt_dir.exists() else False,
+                      "host_tar_sha256": tar_sha,
+                      "container_ckpt_present": ckpt_ok,
+                      "messages_len_at_create": len(agent_state.get("messages", [])),
+                      "seen_segv_at_create": agent_state.get("seen_segv"),
+                      "writes_at_create": agent_state.get("writes"),
+                      "d8_runs_at_create": agent_state.get("d8_runs"),
                   }
                   (snap_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-                  log(f"  [4/4] manifest written")
+                  log(f"  [4/4] manifest.json written")
                   log(f"SNAPSHOT CREATED → {snap_dir}")
+                  log(dir_summary(snap_dir, max_files=12))
                   return snap_dir
 
-          def restore_and_validate(snap_dir: Path, deep=True):
-              """File-level integrity check (still useful as a prerequisite)."""
+          def restore_and_validate_integrity(snap_dir: Path, deep=True):
               tid = threading.get_ident()
-              log(f"[RESTORE-INTEGRITY {tid}] validating {snap_dir.name}")
+              log(f"[INTEGRITY {tid}] validating {snap_dir.name}")
               val_root = snap_dir / f"_val_{uuid.uuid4().hex[:8]}"
               val_root.mkdir(parents=True, exist_ok=True)
               try:
@@ -435,16 +453,18 @@ jobs:
                           tar.extractall(val_root)
                       pov = val_root / "WORKDIR" / "pov" / "pov.js"
                       host_ok = pov.exists() and pov.stat().st_size > 1000
+
                   man_path = snap_dir / "manifest.json"
                   if man_path.exists():
                       man = json.loads(man_path.read_text())
                       if man.get("agent_state_sha256") != sha256_file(state_path):
-                          return False, "state SHA mismatch"
+                          return False, "state SHA mismatch vs manifest"
+
                   detail = f"state_ok=True host_ok={host_ok} deep={deep}"
-                  log(f"[RESTORE-INTEGRITY {tid}] PASSED – {detail}")
+                  log(f"[INTEGRITY {tid}] PASSED – {detail}")
                   return True, detail
               except Exception as e:
-                  log(f"[RESTORE-INTEGRITY {tid}] EXCEPTION: {e}", "ERROR")
+                  log(f"[INTEGRITY {tid}] EXCEPTION: {e}", "ERROR")
                   return False, str(e)
               finally:
                   shutil.rmtree(val_root, ignore_errors=True)
@@ -455,7 +475,7 @@ jobs:
                   return None
               snap_dir = create_composed_snapshot(tag, agent_state)
               with ThreadPoolExecutor(max_workers=1) as ex:
-                  fut = ex.submit(restore_and_validate, snap_dir, deep)
+                  fut = ex.submit(restore_and_validate_integrity, snap_dir, deep)
                   try:
                       ok, detail = fut.result(timeout=70)
                       if ok:
@@ -470,80 +490,91 @@ jobs:
               return snap_dir
 
           # ---------------------------------------------------------------------------
-          # THE MOST CONVINCING TEST: functional round-trip
+          # HIGH-FIDELITY FUNCTIONAL ROUND-TRIP
           # ---------------------------------------------------------------------------
-          def perform_functional_roundtrip(snap_dir: Path, live_state: dict) -> tuple[bool, str]:
+          def perform_high_fidelity_roundtrip(snap_dir: Path, live_state: dict) -> tuple[bool, str, int]:
               """
-              1. Snapshot already taken (snap_dir).
-              2. Deliberately destroy the live in-memory agent state
-                 (simulates process death / restart).
-              3. Re-hydrate from the snapshot.
-              4. Assert bit-for-bit continuity of the critical fields.
+              Highest practical fidelity test inside a single process:
+              1. Snapshot already exists.
+              2. Capture full ground-truth (including canonical messages SHA).
+              3. Deliberately destroy every critical live field.
+              4. Re-hydrate from snapshot (state + host files).
+              5. Multi-point assertion + fidelity scoring.
+              6. Return (ok, detail, fidelity_score 0-100).
               """
-              global roundtrip_ok, roundtrip_detail
-              log_section("FUNCTIONAL ROUND-TRIP RESTORE TEST  BEGIN")
-              log(f"  snap_dir          = {snap_dir}")
-              log(f"  live_state keys   = {list(live_state.keys())}")
-              log(f"  live messages len = {len(live_state.get('messages', []))}")
-              log(f"  live seen_segv    = {live_state.get('seen_segv')}")
-              log(f"  live writes       = {live_state.get('writes')}")
-              log(f"  live d8_runs      = {live_state.get('d8_runs')}")
-              log(f"  live last_written = {live_state.get('last_written')}")
+              global roundtrip_ok, roundtrip_detail, roundtrip_fidelity_score
+              log_section("HIGH-FIDELITY FUNCTIONAL ROUND-TRIP  BEGIN")
+              log(f"  snap_dir = {snap_dir}")
 
-              # ---- 1. Capture ground-truth before destruction ----
+              # ---- Ground truth ----
               gt = copy.deepcopy(live_state)
-              gt_messages_json = json.dumps(gt.get("messages", []), sort_keys=True, default=str)
-              gt_sha = hashlib.sha256(gt_messages_json.encode()).hexdigest()
-              log(f"  ground-truth messages SHA256 = {gt_sha}")
+              gt_messages = gt.get("messages", [])
+              gt_messages_canon = canonical_json(gt_messages)
+              gt_messages_sha = sha256_bytes(gt_messages_canon.encode())
+              gt_fields = {
+                  "seen_segv": gt.get("seen_segv"),
+                  "writes": gt.get("writes"),
+                  "d8_runs": gt.get("d8_runs"),
+                  "agent_d8_runs": gt.get("agent_d8_runs"),
+                  "last_written": gt.get("last_written"),
+                  "turn": gt.get("turn"),
+                  "messages_len": len(gt_messages),
+                  "messages_sha256": gt_messages_sha,
+              }
+              log("  GROUND-TRUTH SNAPSHOT:")
+              for k, v in gt_fields.items():
+                  log(f"    {k:20s} = {v!r}")
 
-              # ---- 2. DESTROY live state (simulate crash / restart) ----
-              log("  >>> DESTROYING LIVE AGENT STATE (simulating process death) <<<")
-              live_state["messages"] = []
-              live_state["seen_segv"] = None
-              live_state["writes"] = -999
-              live_state["d8_runs"] = -999
-              live_state["agent_d8_runs"] = -999
+              # ---- Destroy ----
+              log("  >>> DESTROYING LIVE AGENT STATE (simulating process death / restart) <<<")
+              live_state["messages"] = [{"role": "system", "content": "DESTROYED_PLACEHOLDER"}]
+              live_state["seen_segv"] = "DESTROYED"
+              live_state["writes"] = -99999
+              live_state["d8_runs"] = -99999
+              live_state["agent_d8_runs"] = -99999
               live_state["last_written"] = "DESTROYED"
-              live_state["turn"] = -999
-              log(f"  after destruction: messages_len={len(live_state['messages'])} "
-                  f"seen_segv={live_state['seen_segv']} writes={live_state['writes']} "
-                  f"last_written={live_state['last_written']}")
+              live_state["turn"] = -99999
+              log(f"  after destruction → messages_len={len(live_state['messages'])} "
+                  f"seen_segv={live_state['seen_segv']!r} writes={live_state['writes']} "
+                  f"last_written={live_state['last_written']!r}")
 
-              # ---- 3. RESTORE from snapshot ----
+              # ---- Rehydrate ----
               log("  >>> REHYDRATING FROM SNAPSHOT <<<")
               state_path = snap_dir / "agent_state.json"
               if not state_path.exists():
-                  msg = "round-trip FAILED: agent_state.json missing in snapshot"
+                  msg = "FAIL: agent_state.json missing"
                   log(msg, "ERROR")
                   roundtrip_ok = False
                   roundtrip_detail = msg
-                  return False, msg
+                  return False, msg, 0
 
               restored = json.loads(state_path.read_text())
-              log(f"  restored keys = {list(restored.keys())}")
-              log(f"  restored messages_len = {len(restored.get('messages', []))}")
-              log(f"  restored seen_segv = {restored.get('seen_segv')}")
-              log(f"  restored writes = {restored.get('writes')}")
-              log(f"  restored d8_runs = {restored.get('d8_runs')}")
-              log(f"  restored last_written = {restored.get('last_written')}")
+              log(f"  restored keys          = {list(restored.keys())}")
+              log(f"  restored messages_len  = {len(restored.get('messages', []))}")
+              log(f"  restored seen_segv     = {restored.get('seen_segv')!r}")
+              log(f"  restored writes        = {restored.get('writes')}")
+              log(f"  restored d8_runs       = {restored.get('d8_runs')}")
+              log(f"  restored last_written  = {restored.get('last_written')!r}")
 
-              # Re-inject into the live dict that the agent loop uses
+              # Re-inject
               for k in ("messages", "seen_segv", "writes", "d8_runs", "agent_d8_runs",
                         "last_written", "turn"):
                   if k in restored:
                       live_state[k] = restored[k]
+                      log(f"  re-injected {k:20s} = {live_state[k]!r}" if k != "messages"
+                          else f"  re-injected messages          = <list len={len(live_state[k])}>")
 
-              # Also restore host files from the tar (best-effort)
+              # Restore host files from tar
               tar_path = snap_dir / "host_fs.tar.gz"
+              host_files_restored = 0
               if tar_path.exists():
-                  log("  extracting host_fs.tar.gz back over WORKDIR/OUT …")
-                  tmp_extract = SNAPSHOT_ROOT / f"_rt_extract_{uuid.uuid4().hex[:8]}"
-                  tmp_extract.mkdir(parents=True, exist_ok=True)
+                  log("  extracting host_fs.tar.gz and copying critical files back …")
+                  tmp = SNAPSHOT_ROOT / f"_rt_extract_{uuid.uuid4().hex[:8]}"
+                  tmp.mkdir(parents=True, exist_ok=True)
                   try:
                       with tarfile.open(tar_path, "r:gz") as tar:
-                          tar.extractall(tmp_extract)
-                      # Copy critical files back
-                      src_work = tmp_extract / "WORKDIR"
+                          tar.extractall(tmp)
+                      src_work = tmp / "WORKDIR"
                       if src_work.exists():
                           for p in src_work.rglob("*"):
                               if p.is_file():
@@ -551,79 +582,104 @@ jobs:
                                   dest = WORK / rel
                                   dest.parent.mkdir(parents=True, exist_ok=True)
                                   shutil.copy2(p, dest)
-                      log("  host filesystem re-hydrated")
+                                  host_files_restored += 1
+                      log(f"  host files restored: {host_files_restored}")
                   finally:
-                      shutil.rmtree(tmp_extract, ignore_errors=True)
+                      shutil.rmtree(tmp, ignore_errors=True)
+              else:
+                  log("  no host_fs.tar.gz present")
 
-              # ---- 4. ASSERT CONTINUITY ----
-              log("  >>> ASSERTING CONTINUITY <<<")
+              # ---- Multi-point assertion + fidelity score ----
+              log("  >>> MULTI-POINT CONTINUITY ASSERTIONS <<<")
+              fidelity = 0
+              max_fidelity = 100
               failures = []
 
-              def check(name, expected, actual):
-                  if expected != actual:
-                      failures.append(f"{name}: expected={expected!r} actual={actual!r}")
-                      log(f"  MISMATCH {name}: expected={expected!r} actual={actual!r}", "ERROR")
+              def check(name, expected, actual, weight):
+                  nonlocal fidelity
+                  if expected == actual:
+                      fidelity += weight
+                      log(f"  ✓ {name:30s}  weight={weight:2d}  value={actual!r}")
+                      return True
                   else:
-                      log(f"  OK {name} = {actual!r}")
+                      failures.append(f"{name}: expected={expected!r} actual={actual!r}")
+                      log(f"  ✗ {name:30s}  weight={weight:2d}  expected={expected!r} actual={actual!r}", "ERROR")
+                      return False
 
-              check("seen_segv", gt["seen_segv"], live_state["seen_segv"])
-              check("writes", gt["writes"], live_state["writes"])
-              check("d8_runs", gt["d8_runs"], live_state["d8_runs"])
-              check("agent_d8_runs", gt["agent_d8_runs"], live_state["agent_d8_runs"])
-              check("last_written", gt["last_written"], live_state["last_written"])
-              check("turn", gt["turn"], live_state["turn"])
+              check("seen_segv",          gt_fields["seen_segv"],       live_state.get("seen_segv"),       15)
+              check("writes",             gt_fields["writes"],          live_state.get("writes"),          15)
+              check("d8_runs",            gt_fields["d8_runs"],         live_state.get("d8_runs"),         10)
+              check("agent_d8_runs",      gt_fields["agent_d8_runs"],   live_state.get("agent_d8_runs"),   10)
+              check("last_written",       gt_fields["last_written"],    live_state.get("last_written"),    10)
+              check("turn",               gt_fields["turn"],            live_state.get("turn"),            5)
+              check("messages_len",       gt_fields["messages_len"],    len(live_state.get("messages", [])), 10)
 
-              # Messages – compare by canonical JSON
-              restored_messages_json = json.dumps(live_state.get("messages", []), sort_keys=True, default=str)
-              restored_sha = hashlib.sha256(restored_messages_json.encode()).hexdigest()
-              log(f"  messages SHA before = {gt_sha}")
-              log(f"  messages SHA after  = {restored_sha}")
-              if gt_sha != restored_sha:
-                  failures.append(f"messages SHA mismatch: {gt_sha} vs {restored_sha}")
-                  log("  MISMATCH messages content", "ERROR")
-                  # Show a short diff of lengths / first roles
-                  log(f"  gt messages len={len(gt.get('messages', []))}  "
-                      f"restored len={len(live_state.get('messages', []))}")
+              # Full messages content (highest weight)
+              restored_canon = canonical_json(live_state.get("messages", []))
+              restored_sha = sha256_bytes(restored_canon.encode())
+              log(f"  messages SHA ground-truth = {gt_messages_sha}")
+              log(f"  messages SHA after restore = {restored_sha}")
+              if gt_messages_sha == restored_sha:
+                  fidelity += 25
+                  log(f"  ✓ messages_content_sha256     weight=25  MATCH")
               else:
-                  log("  OK messages content identical (SHA match)")
+                  failures.append(f"messages SHA mismatch: {gt_messages_sha} vs {restored_sha}")
+                  log(f"  ✗ messages_content_sha256     weight=25  MISMATCH", "ERROR")
+                  # Show first differing message roles for diagnosis
+                  gt_roles = [m.get("role") for m in gt_messages[:8]]
+                  rt_roles = [m.get("role") for m in live_state.get("messages", [])[:8]]
+                  log(f"    gt roles (first 8) = {gt_roles}")
+                  log(f"    rt roles (first 8) = {rt_roles}")
+
+              # Host file presence bonus
+              if host_files_restored > 0:
+                  fidelity += 5
+                  log(f"  ✓ host_files_restored         weight=5   count={host_files_restored}")
+              else:
+                  log(f"  ~ host_files_restored         weight=5   (none – still acceptable)")
+
+              fidelity = min(fidelity, max_fidelity)
+              roundtrip_fidelity_score = fidelity
 
               if failures:
-                  msg = "ROUND-TRIP FAILED: " + " | ".join(failures)
+                  msg = (f"ROUND-TRIP FAILED (fidelity={fidelity}/{max_fidelity}). "
+                         f"Failures: {' | '.join(failures)}")
                   log(msg, "ERROR")
                   roundtrip_ok = False
                   roundtrip_detail = msg
-                  log_section("FUNCTIONAL ROUND-TRIP RESTORE TEST  FAILED")
-                  return False, msg
+                  log_section("HIGH-FIDELITY FUNCTIONAL ROUND-TRIP  FAILED")
+                  return False, msg, fidelity
               else:
-                  msg = (f"ROUND-TRIP PASSED: all critical fields identical after "
-                         f"destroy + rehydrate (messages SHA={restored_sha[:16]}…)")
+                  msg = (f"ROUND-TRIP PASSED with fidelity={fidelity}/{max_fidelity}. "
+                         f"All critical fields + full messages history identical after "
+                         f"destroy + rehydrate. messages_sha={restored_sha[:20]}…")
                   log(msg)
                   roundtrip_ok = True
                   roundtrip_detail = msg
-                  log_section("FUNCTIONAL ROUND-TRIP RESTORE TEST  PASSED")
-                  return True, msg
+                  log_section("HIGH-FIDELITY FUNCTIONAL ROUND-TRIP  PASSED")
+                  return True, msg, fidelity
 
           # ---------------------------------------------------------------------------
-          # Lightweight self-tests (kept for regression)
+          # Light self-tests
           # ---------------------------------------------------------------------------
           def run_selftests():
               global snapshot_selftest_ok, snapshot_selftest_fail
-              log_section("LIGHT SELF-TESTS (integrity only)")
+              log_section("LIGHT INTEGRITY SELF-TESTS")
               if not ENABLE_SNAPSHOTS:
                   return
-              # minimal
               st = {"seen_segv": False, "writes": 0, "d8_runs": 0, "agent_d8_runs": 0,
-                    "last_written": None, "turn": -1, "messages": [{"role": "system", "content": "x"}]}
+                    "last_written": None, "turn": -1,
+                    "messages": [{"role": "system", "content": "selftest"}]}
               snap = snapshot_and_validate_in_thread("selftest_minimal", st, deep=True)
               if snap:
                   snapshot_selftest_ok += 1
               else:
                   snapshot_selftest_fail += 1
-              # corrupt
+
               bad = SNAPSHOT_ROOT / f"corrupt_{uuid.uuid4().hex[:6]}"
               bad.mkdir()
               (bad / "agent_state.json").write_text('{"writes":1}')
-              ok, _ = restore_and_validate(bad, deep=False)
+              ok, _ = restore_and_validate_integrity(bad, deep=False)
               if not ok:
                   snapshot_selftest_ok += 1
                   log("selftest corrupt correctly rejected")
@@ -687,7 +743,6 @@ jobs:
           last_written = None
           MIN_USEFUL_WRITE = 400
 
-          # The single dict that holds the “live” agent state we will destroy & restore
           live = {
               "messages": messages,
               "seen_segv": seen_segv,
@@ -698,7 +753,7 @@ jobs:
               "turn": -1,
           }
 
-          log_section("AGENT BOOT v5  FUNCTIONAL ROUND-TRIP + ULTRA-VERBOSE")
+          log_section("AGENT BOOT v5.1  HIGH-FIDELITY FUNCTIONAL ROUND-TRIP + ULTRA-VERBOSE")
           log(f"MODEL={MODEL}  REASONING={REASONING_EFFORT}  MAX={MAX}  SNAPSHOTS={ENABLE_SNAPSHOTS}")
           log(f"FORCE_ROUNDTRIP_AFTER_TURN={FORCE_ROUNDTRIP_AFTER}")
           log(f"WORKDIR={WORK}  OUT={OUT}  SNAPSHOT_ROOT={SNAPSHOT_ROOT}")
@@ -709,7 +764,6 @@ jobs:
 
           for t in range(MAX):
               live["turn"] = t
-              # keep the live dict in sync with the classic variables
               live["messages"] = messages
               live["seen_segv"] = seen_segv
               live["writes"] = writes
@@ -721,8 +775,8 @@ jobs:
               log("=" * 72)
               log(f"=== TURN {t}/{MAX-1}  msgs={len(messages)}  d8={d8_runs} agent_d8={agent_d8_runs} "
                   f"writes={writes} seen_segv={seen_segv} last_written={last_written} "
-                  f"snaps={snapshots_taken} restore_ok={snapshot_restore_ok} "
-                  f"roundtrip_done={roundtrip_performed} ===")
+                  f"snaps={snapshots_taken} integrity_ok={snapshot_restore_ok} "
+                  f"roundtrip_done={roundtrip_performed} fidelity={roundtrip_fidelity_score} ===")
               log("=" * 72)
 
               if last_written and agent_d8_runs == 0 and seen_segv:
@@ -786,7 +840,7 @@ jobs:
                   "d8_runs": d8_runs,
                   "agent_d8_runs": agent_d8_runs,
                   "last_written": last_written,
-                  "messages": messages,          # full history for round-trip
+                  "messages": messages,
                   "action": action,
               }
 
@@ -855,7 +909,7 @@ jobs:
                   messages = [messages[0]] + messages[-20:]
                   log(f"trimmed context to {len(messages)} messages")
 
-              # keep live dict synchronised
+              # keep live synchronised
               live["messages"] = messages
               live["seen_segv"] = seen_segv
               live["writes"] = writes
@@ -865,11 +919,10 @@ jobs:
               live["turn"] = t
 
               # ------------------------------------------------------------------
-              # FORCE THE FUNCTIONAL ROUND-TRIP after the configured turn
+              # FORCE HIGH-FIDELITY FUNCTIONAL ROUND-TRIP
               # ------------------------------------------------------------------
               if (ENABLE_SNAPSHOTS and not roundtrip_performed and t >= FORCE_ROUNDTRIP_AFTER):
-                  log_section(f"TRIGGERING FUNCTIONAL ROUND-TRIP AFTER TURN {t}")
-                  # Take a fresh snapshot of the *current* live state
+                  log_section(f"TRIGGERING HIGH-FIDELITY FUNCTIONAL ROUND-TRIP AFTER TURN {t}")
                   rt_state = {
                       "turn": t,
                       "seen_segv": seen_segv,
@@ -880,20 +933,18 @@ jobs:
                       "messages": messages,
                   }
                   snap_dir = create_composed_snapshot(f"roundtrip_after_turn_{t}", rt_state)
-                  # Now destroy + restore + assert
-                  ok, detail = perform_functional_roundtrip(snap_dir, live)
+                  ok, detail, fid = perform_high_fidelity_roundtrip(snap_dir, live)
                   roundtrip_performed = True
-                  # After a successful round-trip the live dict has been re-hydrated;
-                  # push the values back into the classic variables so the loop continues correctly.
+                  # Push restored values back into the classic loop variables
                   messages = live["messages"]
                   seen_segv = live["seen_segv"]
                   writes = live["writes"]
                   d8_runs = live["d8_runs"]
                   agent_d8_runs = live["agent_d8_runs"]
                   last_written = live["last_written"]
-                  log(f"Post-round-trip variables restored: "
+                  log(f"Post-round-trip variables restored → "
                       f"msgs={len(messages)} seen_segv={seen_segv} writes={writes} "
-                      f"d8_runs={d8_runs} last_written={last_written}")
+                      f"d8_runs={d8_runs} last_written={last_written} fidelity={fid}")
 
           metrics = {
               "turns": t + 1,
@@ -909,19 +960,20 @@ jobs:
               "snapshot_selftest_fail": snapshot_selftest_fail,
               "roundtrip_ok": roundtrip_ok,
               "roundtrip_detail": roundtrip_detail,
+              "roundtrip_fidelity_score": roundtrip_fidelity_score,
               "roundtrip_performed": roundtrip_performed,
           }
           (OUT / "agent_metrics.json").write_text(json.dumps(metrics, indent=2))
           log("=" * 72)
-          log(f"AGENT FINISHED  {json.dumps(metrics, indent=2)}")
+          log(f"AGENT FINISHED\n{json.dumps(metrics, indent=2)}")
           log("=" * 72)
           if roundtrip_performed:
               if roundtrip_ok:
-                  log("*** FUNCTIONAL ROUND-TRIP RESTORE: PASSED ***")
+                  log(f"*** HIGH-FIDELITY FUNCTIONAL ROUND-TRIP: PASSED (fidelity={roundtrip_fidelity_score}/100) ***")
               else:
-                  log("*** FUNCTIONAL ROUND-TRIP RESTORE: FAILED ***", "ERROR")
+                  log(f"*** HIGH-FIDELITY FUNCTIONAL ROUND-TRIP: FAILED (fidelity={roundtrip_fidelity_score}/100) ***", "ERROR")
           else:
-              log("*** FUNCTIONAL ROUND-TRIP was never triggered (not enough turns?) ***", "WARN")
+              log("*** FUNCTIONAL ROUND-TRIP was never triggered ***", "WARN")
           PY
 
       - name: Collect + score + summary
@@ -944,7 +996,7 @@ jobs:
           echo "---- verdict ----"
           python3 -c 'import json;print(json.load(open("/tmp/out/ground_truth_score.json"))["verdict"])'
           echo "[$(date -Is)] === Summary ==="
-          echo "## GLM-5.3-Flash stage eval v5 – functional round-trip restore" >> "$GITHUB_STEP_SUMMARY"
+          echo "## GLM-5.3-Flash stage eval v5.1 – high-fidelity functional round-trip" >> "$GITHUB_STEP_SUMMARY"
           python3 - << 'PY' >> "$GITHUB_STEP_SUMMARY"
           import json
           r = json.load(open("/tmp/out/ground_truth_score.json"))
@@ -957,19 +1009,20 @@ jobs:
           print(f"- agent writes: {m.get('writes')}  agent d8: {m.get('agent_d8_runs')}")
           print(f"- **snapshots taken:** {m.get('snapshots_taken')}  integrity_ok: {m.get('snapshot_restore_ok')}  integrity_fail: {m.get('snapshot_restore_fail')}")
           print(f"- **self-test:** ok={m.get('snapshot_selftest_ok')}  fail={m.get('snapshot_selftest_fail')}")
-          print(f"- **FUNCTIONAL ROUND-TRIP:** ok={m.get('roundtrip_ok')}  performed={m.get('roundtrip_performed')}")
+          print(f"- **HIGH-FIDELITY ROUND-TRIP:** ok={m.get('roundtrip_ok')}  performed={m.get('roundtrip_performed')}  fidelity={m.get('roundtrip_fidelity_score')}/100")
           print(f"  detail: {m.get('roundtrip_detail', '')}")
           print()
-          print("The functional round-trip deliberately destroys the live agent state,")
-          print("re-hydrates it from the snapshot, and asserts bit-for-bit continuity")
-          print("of messages, counters and last_written. This is the strongest evidence")
-          print("that a restore actually works.")
+          print("Fidelity scoring (max 100):")
+          print("  seen_segv 15 + writes 15 + d8_runs 10 + agent_d8_runs 10 + last_written 10")
+          print("  + turn 5 + messages_len 10 + full messages SHA 25 + host files 5")
+          print("A score of 100 means every critical field and the entire conversation")
+          print("history survived a deliberate destroy + rehydrate cycle.")
           PY
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: glm53-flash-stage-eval-v5-roundtrip-${{ github.run_id }}
+          name: glm53-flash-stage-eval-v5.1-roundtrip-${{ github.run_id }}
           path: |
             /tmp/out/
             ${{ env.WORKDIR }}/
